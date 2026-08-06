@@ -15,9 +15,13 @@ import polars as pl
 
 from . import config
 from .probabilities import (
-    ats_cover_probability,
-    home_win_probability,
+    ats_cover_probability_t,
+    fit_t_dof_walk_forward,
+    home_win_probability_t,
+    kelly_fraction,
     market_moneyline_no_vig,
+    over_probability_t,
+    walk_forward_calibrate,
 )
 from .utils import american_payout_multiplier, get_logger
 
@@ -28,12 +32,20 @@ def _bet_side(edge: np.ndarray, threshold: float) -> np.ndarray:
     return np.where(edge > threshold, "home", np.where(edge < -threshold, "away", "none"))
 
 
-def build_ats_bets(preds_with_market: pl.DataFrame, margin_std: float) -> pl.DataFrame:
-    df = preds_with_market.to_pandas().copy()
+def _totals_side(edge: np.ndarray, threshold: float) -> np.ndarray:
+    return np.where(edge > threshold, "over", np.where(edge < -threshold, "under", "none"))
 
-    df["ats_edge"] = df["predicted_margin"] - df["spread_line"]
-    df["model_cover_prob"] = ats_cover_probability(df["predicted_margin"], df["spread_line"], margin_std)
-    df["bet_side"] = _bet_side(df["ats_edge"].to_numpy(), config.ATS_EDGE_THRESHOLD_POINTS)
+
+def regrade_ats(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    """Given a table that already has `ats_edge`, `home_margin`, `spread_line`,
+    and spread odds columns, (re)decide bet_side at `threshold` and grade it.
+    Split out from build_ats_bets so the dashboard can re-run this at a
+    user-chosen threshold without recomputing predictions/edge from scratch."""
+    # reset_index: bet_won below gets a fresh default RangeIndex, which silently
+    # misaligns (and raises) against df's own index unless it's already 0..n-1 --
+    # true for a full to_pandas() conversion but not for an arbitrary filtered slice.
+    df = df.reset_index(drop=True)
+    df["bet_side"] = _bet_side(df["ats_edge"].to_numpy(), threshold)
 
     is_push = np.isclose(df["home_margin"], df["spread_line"])
     home_covers = df["home_margin"] > df["spread_line"]
@@ -62,17 +74,15 @@ def build_ats_bets(preds_with_market: pl.DataFrame, margin_std: float) -> pl.Dat
     df["profit_units"] = profit
     df["staked"] = np.where(df["bet_side"] == "none", 0.0, config.FLAT_STAKE_UNITS)
     df["market"] = "ATS"
-    return pl.from_pandas(df)
+    return df
 
 
-def build_ml_bets(preds_with_market: pl.DataFrame, margin_std: float) -> pl.DataFrame:
-    df = preds_with_market.to_pandas().copy()
-
-    df["model_home_prob"] = home_win_probability(df["predicted_margin"], margin_std)
-    market_home_prob, _ = market_moneyline_no_vig(df["home_moneyline"], df["away_moneyline"])
-    df["market_home_prob_no_vig"] = market_home_prob
-    df["ml_edge"] = df["model_home_prob"] - df["market_home_prob_no_vig"]
-    df["bet_side"] = _bet_side(df["ml_edge"].to_numpy(), config.ML_EDGE_THRESHOLD_PROB)
+def regrade_ml(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    """Same idea as regrade_ats, for the moneyline market: given a table that
+    already has `ml_edge`, `home_margin`, and moneylines, (re)decide bet_side
+    at `threshold` and grade it."""
+    df = df.reset_index(drop=True)  # see regrade_ats -- bet_won needs a clean 0..n-1 index to align against
+    df["bet_side"] = _bet_side(df["ml_edge"].to_numpy(), threshold)
 
     is_tie = df["home_margin"] == 0
     home_wins = df["home_margin"] > 0
@@ -95,6 +105,107 @@ def build_ml_bets(preds_with_market: pl.DataFrame, margin_std: float) -> pl.Data
     df["profit_units"] = profit
     df["staked"] = np.where(df["bet_side"] == "none", 0.0, config.FLAT_STAKE_UNITS)
     df["market"] = "ML"
+    return df
+
+
+def _fit_dof_or_default(df: pd.DataFrame, actual_col: str, predicted_col: str) -> np.ndarray:
+    """fit_t_dof_walk_forward needs a real per-game predicted_std column to
+    standardize residuals against; falls back to config.DEFAULT_T_DOF
+    (practically Normal) in the defensive edge case where the caller only
+    has a single scalar margin_std/total_std (same edge case build_ats_bets/
+    build_ml_bets/build_totals_bets already defend against for `std` itself)."""
+    if "predicted_std" not in df.columns:
+        return np.full(len(df), config.DEFAULT_T_DOF)
+    return fit_t_dof_walk_forward(df, actual_col, predicted_col, "predicted_std")
+
+
+def build_ats_bets(preds_with_market: pl.DataFrame, margin_std: float) -> pl.DataFrame:
+    df = preds_with_market.to_pandas().copy()
+    std = df["predicted_std"] if "predicted_std" in df.columns else margin_std
+    df["ats_edge"] = df["predicted_margin"] - df["spread_line"]
+    # Student's-t instead of Normal: calibration_bins on the raw (pre-
+    # isotonic) probability showed real, measured OVERCONFIDENCE -- model
+    # predictions more extreme than actual outcome rates in both directions,
+    # worst for LightGBM specifically. A walk-forward-fit degrees-of-freedom
+    # (probabilities.fit_t_dof_walk_forward) lets each model's own residual
+    # tail shape correct for this directly, converging to Normal (dof~30)
+    # when a model's raw probabilities are already well-behaved. See
+    # config.py's note for the measured result.
+    dof = _fit_dof_or_default(df, "home_margin", "predicted_margin")
+    df["model_cover_prob_raw"] = ats_cover_probability_t(df["predicted_margin"], df["spread_line"], std, dof)
+    home_covers = (df["home_margin"] > df["spread_line"]).to_numpy().astype(float)
+    df["model_cover_prob"] = walk_forward_calibrate(df, "model_cover_prob_raw", home_covers)
+    df = regrade_ats(df, config.ATS_EDGE_THRESHOLD_POINTS)
+    return pl.from_pandas(df)
+
+
+def build_ml_bets(preds_with_market: pl.DataFrame, margin_std: float, calibrate: bool = True) -> pl.DataFrame:
+    df = preds_with_market.to_pandas().copy()
+    std = df["predicted_std"] if "predicted_std" in df.columns else margin_std
+    dof = _fit_dof_or_default(df, "home_margin", "predicted_margin")
+    df["model_home_prob_raw"] = home_win_probability_t(df["predicted_margin"], std, dof)
+    if calibrate:
+        home_win = (df["home_margin"] > 0).to_numpy().astype(float)
+        df["model_home_prob"] = walk_forward_calibrate(df, "model_home_prob_raw", home_win)
+    else:
+        df["model_home_prob"] = df["model_home_prob_raw"]
+    market_home_prob, _ = market_moneyline_no_vig(df["home_moneyline"], df["away_moneyline"])
+    df["market_home_prob_no_vig"] = market_home_prob
+    df["ml_edge"] = df["model_home_prob"] - df["market_home_prob_no_vig"]
+    df = regrade_ml(df, config.ML_EDGE_THRESHOLD_PROB)
+    return pl.from_pandas(df)
+
+
+def regrade_totals(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    """Given a table that already has `total_edge`, `total_points`,
+    `total_line`, and over/under odds columns, (re)decide bet_side
+    (over/under) at `threshold` and grade it. Same structure as
+    regrade_ats/regrade_ml, for the totals market."""
+    df = df.reset_index(drop=True)  # see regrade_ats -- bet_won needs a clean 0..n-1 index to align against
+    df["bet_side"] = _totals_side(df["total_edge"].to_numpy(), threshold)
+
+    is_push = np.isclose(df["total_points"], df["total_line"])
+    over_hits = df["total_points"] > df["total_line"]
+
+    bet_odds = np.where(
+        df["bet_side"] == "over",
+        df["over_odds"].fillna(config.DEFAULT_SPREAD_ODDS),
+        df["under_odds"].fillna(config.DEFAULT_SPREAD_ODDS),
+    )
+    payout_mult = american_payout_multiplier(bet_odds)
+
+    bet_wins = np.where(
+        df["bet_side"] == "over", over_hits, np.where(df["bet_side"] == "under", ~over_hits, False)
+    )
+
+    profit = np.select(
+        [df["bet_side"] == "none", is_push, bet_wins],
+        [0.0, 0.0, config.FLAT_STAKE_UNITS * payout_mult],
+        default=-config.FLAT_STAKE_UNITS,
+    )
+
+    df["is_push"] = is_push
+    bet_won = pd.Series(bet_wins, dtype="boolean")
+    bet_won[df["bet_side"] == "none"] = pd.NA
+    df["bet_won"] = bet_won
+    df["profit_units"] = profit
+    df["staked"] = np.where(df["bet_side"] == "none", 0.0, config.FLAT_STAKE_UNITS)
+    df["market"] = "TOTAL"
+    return df
+
+
+def build_totals_bets(preds_with_market: pl.DataFrame, total_std: float, calibrate: bool = True) -> pl.DataFrame:
+    df = preds_with_market.to_pandas().copy()
+    std = df["predicted_std"] if "predicted_std" in df.columns else total_std
+    df["total_edge"] = df["predicted_total"] - df["total_line"]
+    dof = _fit_dof_or_default(df, "total_points", "predicted_total")
+    df["model_over_prob_raw"] = over_probability_t(df["predicted_total"], df["total_line"], std, dof)
+    if calibrate:
+        over_hit = (df["total_points"] > df["total_line"]).to_numpy().astype(float)
+        df["model_over_prob"] = walk_forward_calibrate(df, "model_over_prob_raw", over_hit)
+    else:
+        df["model_over_prob"] = df["model_over_prob_raw"]
+    df = regrade_totals(df, config.TOTAL_EDGE_THRESHOLD_POINTS)
     return pl.from_pandas(df)
 
 
@@ -116,3 +227,250 @@ def summarize(bets: pl.DataFrame) -> dict:
         "total_profit_units": total_profit,
         "roi": total_profit / total_staked if total_staked else float("nan"),
     }
+
+
+def simulate_bankroll(
+    bets: pd.DataFrame,
+    prob_col: str,
+    home_odds_col: str,
+    away_odds_col: str,
+    kelly_multiplier: float = 0.25,
+    kelly_cap: float = 0.05,
+    starting_bankroll: float = 100.0,
+) -> pd.DataFrame:
+    """Sequential, compounding bankroll simulation for placed bets, in
+    chronological order. Unlike the flat-stake backtest above (a fixed 1 unit
+    every time, regardless of bankroll -- fine for measuring whether an edge
+    exists, but not how you'd actually size real bets), this stakes a
+    fraction of the CURRENT bankroll set by the Kelly criterion, scaled down
+    by `kelly_multiplier` (fractional Kelly -- full Kelly is too aggressive
+    when the probability estimate feeding it is uncertain, which the
+    Diagnostics tab already shows ours is) and capped at `kelly_cap` of
+    bankroll per bet as a practical safeguard against a single mis-estimated
+    game wiping out a big chunk of the bankroll.
+    """
+    placed = bets[bets["bet_side"] != "none"].sort_values(["season", "week", "game_id"]).reset_index(drop=True)
+    if placed.empty:
+        placed = placed.copy()
+        placed["kelly_stake_frac"] = []
+        placed["bankroll"] = []
+        return placed
+
+    is_home = (placed["bet_side"] == "home").to_numpy()
+    prob_for_side = np.where(is_home, placed[prob_col], 1.0 - placed[prob_col])
+    odds_for_side = np.where(is_home, placed[home_odds_col], placed[away_odds_col])
+    odds_for_side = pd.Series(odds_for_side).fillna(config.DEFAULT_SPREAD_ODDS).to_numpy()
+
+    kelly_f = kelly_fraction(prob_for_side, odds_for_side) * kelly_multiplier
+    kelly_f = np.clip(kelly_f, 0.0, kelly_cap)
+    payout_mult = american_payout_multiplier(odds_for_side)
+
+    is_push = placed["is_push"].to_numpy()
+    bet_won = placed["bet_won"].to_numpy()
+
+    bankroll = starting_bankroll
+    bankroll_history = np.empty(len(placed))
+    stake_history = np.empty(len(placed))
+    for i in range(len(placed)):
+        stake = bankroll * kelly_f[i]
+        if is_push[i]:
+            profit = 0.0
+        elif bet_won[i]:
+            profit = stake * payout_mult[i]
+        else:
+            profit = -stake
+        bankroll += profit
+        stake_history[i] = stake
+        bankroll_history[i] = bankroll
+
+    placed = placed.copy()
+    placed["kelly_stake_frac"] = kelly_f
+    placed["kelly_stake"] = stake_history
+    placed["bankroll"] = bankroll_history
+    return placed
+
+
+def max_drawdown(bankroll: np.ndarray) -> float:
+    """Largest peak-to-trough decline in a bankroll series, as a fraction
+    (e.g. -0.35 means a 35% drawdown from the running peak at some point)."""
+    arr = np.asarray(bankroll, dtype=float)
+    if len(arr) == 0:
+        return float("nan")
+    running_max = np.maximum.accumulate(arr)
+    drawdown = (arr - running_max) / running_max
+    return float(drawdown.min())
+
+
+def bootstrap_bankroll_paths(
+    bets: pd.DataFrame,
+    prob_col: str,
+    home_odds_col: str,
+    away_odds_col: str,
+    kelly_multiplier: float = 0.25,
+    kelly_cap: float = 0.05,
+    starting_bankroll: float = 100.0,
+    n_boot: int = 500,
+    seed: int = 0,
+) -> np.ndarray:
+    """The single realized bankroll path from simulate_bankroll is one sample
+    from a highly path-dependent process -- Kelly compounding means the exact
+    ORDER wins and losses happened in changes the outcome, not just their
+    count. A path that looks great (or terrible) can be mostly the luck of
+    that order, not evidence the sizing rule itself is good or bad.
+
+    This resamples the same placed-bet pool WITH REPLACEMENT `n_boot` times
+    (same bootstrap idea as evaluation.summarize_with_ci, just applied to a
+    compounding path instead of a flat mean) and re-runs the identical
+    Kelly-sizing rule on each resampled draw, to show the RANGE of plausible
+    outcomes instead of one line. Returns an (n_boot, n_bets) array of
+    bankroll values; the recurrence is inherently sequential (bankroll[t]
+    depends on bankroll[t-1]), so the loop is over bet index, vectorized
+    across all n_boot paths at each step rather than looped per-path.
+    """
+    placed = bets[bets["bet_side"] != "none"].reset_index(drop=True)
+    n = len(placed)
+    if n == 0:
+        return np.empty((n_boot, 0))
+
+    is_home = (placed["bet_side"] == "home").to_numpy()
+    prob_for_side = np.where(is_home, placed[prob_col], 1.0 - placed[prob_col])
+    odds_for_side = np.where(is_home, placed[home_odds_col], placed[away_odds_col])
+    odds_for_side = pd.Series(odds_for_side).fillna(config.DEFAULT_SPREAD_ODDS).to_numpy()
+
+    kelly_f_pool = np.clip(kelly_fraction(prob_for_side, odds_for_side) * kelly_multiplier, 0.0, kelly_cap)
+    payout_mult_pool = american_payout_multiplier(odds_for_side)
+    is_push_pool = placed["is_push"].to_numpy()
+    bet_won_pool = placed["bet_won"].to_numpy()
+
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, n, size=(n_boot, n))
+    kelly_f = kelly_f_pool[idx]
+    payout_mult = payout_mult_pool[idx]
+    is_push = is_push_pool[idx]
+    bet_won = bet_won_pool[idx]
+
+    bankroll = np.full(n_boot, starting_bankroll)
+    paths = np.empty((n_boot, n))
+    for t in range(n):
+        stake = bankroll * kelly_f[:, t]
+        profit = np.where(is_push[:, t], 0.0, np.where(bet_won[:, t], stake * payout_mult[:, t], -stake))
+        bankroll = bankroll + profit
+        paths[:, t] = bankroll
+    return paths
+
+
+def sweep_kelly_multiplier(
+    bets: pd.DataFrame,
+    prob_col: str,
+    home_odds_col: str,
+    away_odds_col: str,
+    multipliers: np.ndarray,
+    kelly_cap: float = 0.05,
+    starting_bankroll: float = 100.0,
+    n_boot: int = 300,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """Empirically find the growth-optimal fractional-Kelly multiplier
+    instead of assuming a conventional one (e.g. 0.25) is right. For each
+    candidate multiplier, bootstrap-resamples the same bet pool `n_boot`
+    times (bootstrap_bankroll_paths) and measures the resulting distribution
+    of GEOMETRIC growth -- mean log(bankroll_final / bankroll_start), the
+    actual quantity Kelly theory optimizes -- plus two tail-risk views
+    (5th-percentile final bankroll, and the fraction of resampled paths
+    that ever drew down more than 50%). The multiplier that maximizes mean
+    log-growth is the empirically-optimal one GIVEN this bet pool's own
+    real variance; if that peak sits well below the naive full-Kelly value
+    of 1.0, that's direct evidence of how much the probability estimate's
+    own uncertainty should discount the textbook stake.
+    """
+    records = []
+    for mult in multipliers:
+        paths = bootstrap_bankroll_paths(
+            bets, prob_col, home_odds_col, away_odds_col,
+            kelly_multiplier=float(mult), kelly_cap=kelly_cap, starting_bankroll=starting_bankroll,
+            n_boot=n_boot, seed=seed,
+        )
+        if paths.shape[1] == 0:
+            continue
+        final = paths[:, -1]
+        log_growth = np.log(final / starting_bankroll)
+        mean_log_growth = float(log_growth.mean())
+        n_bets = paths.shape[1]
+        per_bet_rate = float(np.exp(mean_log_growth / n_bets) - 1.0)
+
+        running_max = np.maximum.accumulate(paths, axis=1)
+        drawdown = (paths - running_max) / running_max
+        worst_drawdown = drawdown.min(axis=1)
+
+        records.append({
+            "kelly_multiplier": float(mult),
+            "mean_log_growth": mean_log_growth,
+            "per_bet_growth_rate": per_bet_rate,
+            "median_final_bankroll": float(np.median(final)),
+            "p5_final_bankroll": float(np.percentile(final, 5)),
+            "prob_drawdown_50": float((worst_drawdown < -0.5).mean()),
+        })
+    return pd.DataFrame(records)
+
+
+def optimal_threshold_walk_forward(
+    bets_full: pd.DataFrame,
+    market: str,
+    threshold_grid: np.ndarray,
+    min_train_seasons: int = 3,
+    min_bets: int = 20,
+    n_boot: int = 1000,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """For each test season, grid-search the bet-selection threshold using
+    ONLY strictly earlier seasons -- selecting whichever threshold maximized
+    the bootstrap 95% CI LOWER BOUND on ROI (not raw mean ROI, which rewards
+    a threshold that got lucky on a handful of bets) -- then apply that
+    season's chosen threshold OUT OF SAMPLE to grade the test season itself.
+    Same walk-forward discipline used everywhere else in this project,
+    applied to a hyperparameter instead of the model. `bets_full` needs
+    ats_edge (or ml_edge) plus everything regrade_ats/regrade_ml needs,
+    already computed for every game regardless of threshold. Returns one
+    row per test season with the threshold chosen ahead of time and the
+    REALIZED (never-peeked-at) result under that choice.
+    """
+    regrade_fn = regrade_ats if market == "ats" else regrade_ml
+    rng = np.random.default_rng(seed)
+    seasons = sorted(bets_full["season"].unique())
+
+    records = []
+    for test_season in seasons:
+        train = bets_full[bets_full["season"] < test_season]
+        if train["season"].nunique() < min_train_seasons:
+            continue
+
+        best_t, best_lo = None, -np.inf
+        for t in threshold_grid:
+            regraded = regrade_fn(train, float(t))
+            placed = regraded[regraded["bet_side"] != "none"]
+            n = len(placed)
+            if n < min_bets:
+                continue
+            profit = placed["profit_units"].to_numpy()
+            idx = rng.integers(0, n, size=(n_boot, n))
+            lo = np.percentile(profit[idx].mean(axis=1), 2.5)
+            if lo > best_lo:
+                best_lo, best_t = lo, float(t)
+
+        if best_t is None:
+            continue
+
+        test = bets_full[bets_full["season"] == test_season]
+        regraded_test = regrade_fn(test, best_t)
+        placed_test = regraded_test[regraded_test["bet_side"] != "none"]
+        n_bets = len(placed_test)
+        staked = placed_test["staked"].sum()
+        profit = placed_test["profit_units"].sum()
+        records.append({
+            "season": test_season,
+            "chosen_threshold": best_t,
+            "n_bets": n_bets,
+            "profit": float(profit) if n_bets else 0.0,
+            "roi": float(profit / staked) if staked else np.nan,
+        })
+    return pd.DataFrame(records)

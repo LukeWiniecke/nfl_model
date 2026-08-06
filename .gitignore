@@ -8,3 +8,6 @@ outputs/
 run_log.txt
 .ipynb_checkpoints/
 *.egg-info/
+
+# Runtime logs (streamlit server, scheduled refresh runs)
+logs/

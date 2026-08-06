@@ -19,8 +19,12 @@ TEAM_COLS_PBP = ["home_team", "away_team", "posteam", "defteam"]
 
 
 def clean_schedules(df: pl.DataFrame) -> pl.DataFrame:
+    # Deliberately KEEPS not-yet-played games (null scores) so live_picks can
+    # predict them -- home_margin/home_score/away_score just come out null
+    # for those rows. Every step that trains or backtests (modeling._walk_forward,
+    # skill_vs_market, etc.) already filters on home_margin.is_not_null()
+    # itself, so this doesn't change any backtest result.
     df = df.filter(pl.col("game_type").is_in(config.GAME_TYPES_KEPT))
-    df = df.filter(pl.col("home_score").is_not_null() & pl.col("away_score").is_not_null())
 
     for col in TEAM_COLS_SCHEDULES:
         df = df.with_columns(standardize_team(pl.col(col)).alias(col))
@@ -31,11 +35,11 @@ def clean_schedules(df: pl.DataFrame) -> pl.DataFrame:
     )
 
     keep = [
-        "game_id", "season", "week", "game_type", "gameday",
+        "game_id", "old_game_id", "season", "week", "game_type", "gameday",
         "home_team", "away_team", "home_score", "away_score", "home_margin",
         "spread_line", "total_line", "home_moneyline", "away_moneyline",
         "home_spread_odds", "away_spread_odds", "over_odds", "under_odds",
-        "home_rest", "away_rest", "div_game", "roof", "surface", "temp", "wind",
+        "home_rest", "away_rest", "div_game", "roof", "surface", "temp", "wind", "location",
     ]
     keep = [c for c in keep if c in df.columns]
     df = df.select(keep).sort(["season", "week", "game_id"])
