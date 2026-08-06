@@ -56,6 +56,12 @@ def add_bet_context(bets: pl.DataFrame) -> pl.DataFrame:
         default="Weeks 14-18",
     )
 
+    # Development vs. held-out era (config.HOLDOUT_FIRST_SEASON). Every
+    # keep/revert decision in config.py should be made on "development" only;
+    # "holdout" is the check that the configuration wasn't just fit to the
+    # backtest. See config.HOLDOUT_FIRST_SEASON.
+    df["era"] = np.where(df["season"] >= config.HOLDOUT_FIRST_SEASON, "holdout", "development")
+
     return pl.from_pandas(df)
 
 
@@ -106,6 +112,53 @@ def summarize_by_spread_bucket(bets: pl.DataFrame) -> pl.DataFrame:
 
 def summarize_by_week_bucket(bets: pl.DataFrame) -> pl.DataFrame:
     return summarize_by(bets, ["week_bucket"])
+
+
+def summarize_by_era(bets: pl.DataFrame) -> pl.DataFrame:
+    """Development-era vs held-out-era results, with bootstrap CIs on both.
+    The holdout number is the only one in this project that hasn't had
+    configuration decisions fit to it -- read it first, and read it knowing
+    its sample is small enough that its CI will be wide."""
+    return summarize_with_ci(bets, ["era"])
+
+
+def decision_is_significant(bets_before: pl.DataFrame, bets_after: pl.DataFrame, n_boot: int = 5000, seed: int = 0) -> dict:
+    """Is a proposed change actually distinguishable from noise?
+
+    The failure mode this exists to prevent is the one recorded throughout
+    config.py: accepting a feature because ROI moved from -0.6% to +1.0% when
+    the bootstrap 95% CI on ROI at that sample size is roughly +/-4 points --
+    i.e. the observed move is several times smaller than the measurement
+    error, so the sign of the "improvement" is essentially arbitrary.
+
+    Bootstraps the ROI DIFFERENCE directly (resampling each bet pool
+    independently) and reports whether the 95% interval on that difference
+    excludes zero. Use it before writing another "measured directly: kept"
+    note. Expect the honest answer to usually be "no" -- 13 seasons is not
+    much data for a difference this small.
+    """
+    rng = np.random.default_rng(seed)
+
+    def _pool(bets):
+        return bets.filter(pl.col("bet_side") != "none")["profit_units"].to_numpy()
+
+    a, b = _pool(bets_before), _pool(bets_after)
+    if len(a) < 2 or len(b) < 2:
+        return {"roi_before": np.nan, "roi_after": np.nan, "delta": np.nan,
+                "ci_lo": np.nan, "ci_hi": np.nan, "significant": False}
+
+    boot_a = a[rng.integers(0, len(a), size=(n_boot, len(a)))].mean(axis=1)
+    boot_b = b[rng.integers(0, len(b), size=(n_boot, len(b)))].mean(axis=1)
+    delta = boot_b - boot_a
+    lo, hi = (float(v) for v in np.percentile(delta, [2.5, 97.5]))
+    return {
+        "roi_before": float(a.mean()),
+        "roi_after": float(b.mean()),
+        "delta": float(b.mean() - a.mean()),
+        "ci_lo": lo,
+        "ci_hi": hi,
+        "significant": bool(lo > 0 or hi < 0),
+    }
 
 
 def summarize_with_ci(bets: pl.DataFrame, group_cols: list[str], n_boot: int = 2000, seed: int = 0) -> pl.DataFrame:

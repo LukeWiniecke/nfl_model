@@ -21,11 +21,44 @@ import pandas as pd
 import polars as pl
 from sklearn.isotonic import IsotonicRegression
 
+from scipy.stats import norm
+
 from . import config
-from .probabilities import ats_cover_probability_t, fit_dof_all_history, home_win_probability_t, market_moneyline_no_vig
+from .probabilities import (
+    ats_cover_probability_t,
+    breakeven_probability,
+    fit_dof_all_history,
+    fit_edge_shrinkage_all_history,
+    home_win_probability_t,
+    market_moneyline_no_vig,
+)
 from .utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def _live_ats_threshold(hist_ats_bets: pl.DataFrame, live: pd.DataFrame) -> np.ndarray:
+    """Live analogue of backtesting.adaptive_ats_threshold: the same
+    shrinkage-and-vig derivation, but with one slope fit on ALL graded
+    history rather than season-by-season (there is only one batch of upcoming
+    games to apply it to). Without this the live board was selecting picks at
+    the old fixed 1.5-point bar while the backtest that justified it now uses
+    a derived one nearly 3x higher -- i.e. the thing being bet would not have
+    been the thing that was validated."""
+    hist = hist_ats_bets.filter(
+        pl.col("home_margin").is_not_null() & pl.col("spread_line").is_not_null()
+    ).to_pandas()
+    slope, sd = fit_edge_shrinkage_all_history(
+        (hist["predicted_margin"] - hist["spread_line"]).to_numpy(),
+        (hist["home_margin"] - hist["spread_line"]).to_numpy(),
+    )
+    if not np.isfinite(slope) or not np.isfinite(sd):
+        return np.full(len(live), config.ATS_EDGE_THRESHOLD_POINTS)
+
+    home_odds = live["home_spread_odds"].fillna(config.DEFAULT_SPREAD_ODDS).to_numpy()
+    away_odds = live["away_spread_odds"].fillna(config.DEFAULT_SPREAD_ODDS).to_numpy()
+    p_breakeven = np.maximum(breakeven_probability(home_odds), breakeven_probability(away_odds))
+    return norm.ppf(p_breakeven) * sd / slope
 
 
 def _calibrate_live(hist_bets: pl.DataFrame, raw_col: str, outcome_expr: pl.Expr, live_raw: np.ndarray) -> np.ndarray:
@@ -80,8 +113,38 @@ def build_upcoming_board(
     df["market_home_prob_no_vig"] = market_home_prob
     df["ml_edge"] = df["model_home_prob"] - df["market_home_prob_no_vig"]
 
+    # Selection rules, carried over from the backtest so the live board and
+    # the validated backtest agree on what counts as a pick.
+    if config.USE_ADAPTIVE_THRESHOLDS:
+        df["ats_threshold_used"] = _live_ats_threshold(hist_ats_bets, df)
+    else:
+        df["ats_threshold_used"] = config.ATS_EDGE_THRESHOLD_POINTS
+    df["ats_qualifies"] = df["ats_edge"].abs() > df["ats_threshold_used"]
+    df["ats_edge_shrunk"] = df["ats_edge"] * _live_shrinkage_slope(hist_ats_bets)
+
+    df["ml_threshold_used"] = config.ML_EDGE_THRESHOLD_PROB
+    ml_side = np.where(
+        df["ml_edge"] > config.ML_EDGE_THRESHOLD_PROB, "home",
+        np.where(df["ml_edge"] < -config.ML_EDGE_THRESHOLD_PROB, "away", "none"),
+    )
+    if config.ML_UNDERDOG_ONLY:
+        favorite_side = np.where(df["spread_line"].to_numpy() > 0, "home", "away")
+        ml_side = np.where(ml_side == favorite_side, "none", ml_side)
+    df["ml_qualifies"] = ml_side != "none"
+
     df["model"] = name
     return df
+
+
+def _live_shrinkage_slope(hist_ats_bets: pl.DataFrame) -> float:
+    hist = hist_ats_bets.filter(
+        pl.col("home_margin").is_not_null() & pl.col("spread_line").is_not_null()
+    ).to_pandas()
+    slope, _ = fit_edge_shrinkage_all_history(
+        (hist["predicted_margin"] - hist["spread_line"]).to_numpy(),
+        (hist["home_margin"] - hist["spread_line"]).to_numpy(),
+    )
+    return slope if np.isfinite(slope) else float("nan")
 
 
 def build_all_boards(

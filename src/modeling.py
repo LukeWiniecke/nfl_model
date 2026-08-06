@@ -52,7 +52,20 @@ MEAN_ABS_TO_STD = float(np.sqrt(np.pi / 2))
 # (feature_engineering.compute_qb_form's carried-forward branch always
 # assumes continuity=1 for both teams), limiting it to a training-only
 # signal even in principle.
-STD_FEATURES = ["elo_diff_abs", "div_game", "is_playoff", "wind_filled", "is_dome", "rest_diff_abs"]
+#
+# wind_filled was dropped here along with every other weather feature -- see
+# config.WEATHER_FEATURES_DISABLED for the train/serve-skew reason.
+STD_FEATURES = ["elo_diff_abs", "div_game", "is_playoff", "is_dome", "rest_diff_abs"]
+
+# Raw modeling-table columns _std_feature_frame derives STD_FEATURES from.
+# Kept as its own list because the out-of-fold std pool in _walk_forward has
+# to carry these forward per fold, and the ensemble re-joins them from the
+# modeling table (predictions frames don't carry feature columns).
+STD_RAW_CONTEXT_COLS = ["elo_diff", "div_game", "game_type", "is_dome", "rest_diff"]
+
+
+def _std_context_columns(df: pl.DataFrame) -> list[str]:
+    return [c for c in STD_RAW_CONTEXT_COLS if c in df.columns]
 
 
 def _std_feature_frame(df: pl.DataFrame) -> pd.DataFrame:
@@ -68,7 +81,22 @@ def _fit_predict_conditional_std(train_df: pl.DataFrame, test_df: pl.DataFrame, 
     """Fit a small Ridge on |residual| ~ STD_FEATURES using only the training
     pool, then predict a per-game std for the test fold. Floored/capped
     (config.MARGIN_STD_FLOOR/CAP) so one badly-fit fold can't collapse a
-    game's probability to 0/1 or blow it up into meaninglessness."""
+    game's probability to 0/1 or blow it up into meaninglessness.
+
+    `train_df`/`resid_train` MUST be an OUT-OF-FOLD pair (see _walk_forward's
+    oof pool) wherever one is available, not a model's own in-sample training
+    residuals. This is not a stylistic preference -- feeding in-sample
+    residuals here silently breaks every probability downstream for any model
+    that fits its training data closely. Measured on the previous version,
+    which did exactly that: LightGBM's mean predicted_std came out at 9.13
+    against a true out-of-sample residual std of 13.54 (std of standardized
+    residuals = 1.51, i.e. ~50% overconfident on every game), while ridge --
+    which barely overfits -- was fine at 1.005. That scale error was the real
+    cause of the "raw probabilities are overconfident" finding in config.py,
+    and it's why LightGBM's walk-forward Student's-t fit pinned to the dof
+    FLOOR: a shape parameter was being asked to absorb a scale error it
+    mathematically cannot fix.
+    """
     std_X_train = _std_feature_frame(train_df)
     medians = std_X_train.median().to_dict()
     std_X_train = _impute(std_X_train, medians)
@@ -81,6 +109,22 @@ def _fit_predict_conditional_std(train_df: pl.DataFrame, test_df: pl.DataFrame, 
     return np.clip(pred_abs_resid * MEAN_ABS_TO_STD, config.MARGIN_STD_FLOOR, config.MARGIN_STD_CAP)
 
 
+def _drop_disabled(cols: list[str], df: pl.DataFrame) -> list[str]:
+    """Keep only columns that exist, minus anything config has disabled.
+
+    Belt-and-braces against this file's recurring failure mode: LightGBM's
+    feature sets are built by SUFFIX auto-detection plus a hardcoded list, so
+    a feature dropped from config.py's explicit ridge lists can still reach
+    LightGBM through either route. Weather was doing exactly that -- removed
+    from MARGIN_MODEL_FEATURES/TOTAL_MODEL_FEATURES but still named literally
+    below, so ridge stopped seeing it while LightGBM did not. Routing every
+    list through here means config.WEATHER_FEATURES_DISABLED is authoritative
+    for both models.
+    """
+    disabled = set(config.WEATHER_FEATURES_DISABLED)
+    return [c for c in cols if c in df.columns and c not in disabled]
+
+
 def gbm_feature_columns(df: pl.DataFrame) -> list[str]:
     suffixes = ("_roll8_diff", "_ewm_diff")
     cols = [c for c in df.columns if c.endswith(suffixes)]
@@ -91,7 +135,7 @@ def gbm_feature_columns(df: pl.DataFrame) -> list[str]:
     cols = [c for c in cols if not c.startswith("off_plays")]
     cols += [
         "elo_diff", "rest_diff", "div_game", "qb_continuity_diff",
-        "neutral_site", "is_dome", "temp_filled", "wind_filled",
+        "neutral_site", "is_dome",
     ]
     # injury_diff deliberately excluded here: kept for ridge (see config.py),
     # but reverted for LightGBM -- consistently made it slightly worse, same
@@ -99,7 +143,8 @@ def gbm_feature_columns(df: pl.DataFrame) -> list[str]:
     # Both the raw-points and residual-based referee-crew tendency features
     # were tried and reverted here too -- see config.py's note near
     # MARGIN_MODEL_FEATURES.
-    return [c for c in cols if c in df.columns]
+    # temp_filled/wind_filled removed -- see config.WEATHER_FEATURES_DISABLED.
+    return _drop_disabled(cols, df)
 
 
 def gbm_total_feature_columns(df: pl.DataFrame) -> list[str]:
@@ -111,8 +156,9 @@ def gbm_total_feature_columns(df: pl.DataFrame) -> list[str]:
     # off_plays (pace) deliberately excluded here: kept for ridge_total (see
     # config.py), but reverted for LightGBM -- consistently made it worse.
     cols = [c for c in cols if not c.startswith("off_plays")]
-    cols += ["div_game", "neutral_site", "is_dome", "temp_filled", "wind_filled"]
-    return [c for c in cols if c in df.columns]
+    # temp_filled/wind_filled removed -- see config.WEATHER_FEATURES_DISABLED.
+    cols += ["div_game", "neutral_site", "is_dome"]
+    return _drop_disabled(cols, df)
 
 
 @dataclass
@@ -183,8 +229,21 @@ def _walk_forward(
 
     all_preds = []
     all_contribs = []
-    resid_train_pool = []
     last_medians = {}
+
+    # Out-of-fold pool for the conditional-std model. Each completed fold's
+    # test season is, by construction, a set of predictions the model never
+    # trained on -- exactly the residual distribution a future game will be
+    # drawn from. Accumulating them as folds complete costs nothing (the
+    # predictions are already computed) and gives the std model an honest
+    # target, instead of the in-sample residuals it used to get.
+    #
+    # Ordering matters for correctness: this fold's OWN residuals are appended
+    # only AFTER its predicted_std has been computed, so the std model for
+    # season S only ever sees seasons < S. Same walk-forward rule as
+    # everything else here.
+    oof_ctx: list[pl.DataFrame] = []
+    oof_resid: list[np.ndarray] = []
 
     for test_season in test_seasons:
         train_df = df.filter(pl.col("season") < test_season)
@@ -204,15 +263,30 @@ def _walk_forward(
         X_test = _impute(X_test, medians)
         pred = model.predict(X_test)
 
-        train_pred = model.predict(X_train)
-        resid_train = y_train.to_numpy() - train_pred
-        resid_train_pool.append(resid_train)
+        # The earliest fold has no completed folds behind it yet, so there are
+        # no out-of-fold residuals to fit on. Fall back to in-sample residuals
+        # there rather than skipping the season -- imperfect, but it affects
+        # one fold's std only, and the pool takes over from the next season on.
+        n_oof = sum(len(r) for r in oof_resid)
+        if n_oof >= config.MIN_OOF_STD_GAMES:
+            std_fit_df = pl.concat(oof_ctx, how="vertical_relaxed")
+            std_fit_resid = np.concatenate(oof_resid)
+        else:
+            std_fit_df = train_df
+            std_fit_resid = y_train.to_numpy() - model.predict(X_train)
+            logger.info(
+                f"[{model_name}] {test_season}: only {n_oof} out-of-fold residuals available "
+                f"(<{config.MIN_OOF_STD_GAMES}), falling back to in-sample residuals for the std model"
+            )
 
         out = test_df.select(["game_id", "season", "week", "home_team", "away_team", target_col]).to_pandas()
         out[pred_col] = pred
-        out["predicted_std"] = _fit_predict_conditional_std(train_df, test_df, resid_train)
+        out["predicted_std"] = _fit_predict_conditional_std(std_fit_df, test_df, std_fit_resid)
         out["model"] = model_name
         all_preds.append(out)
+
+        oof_ctx.append(test_df.select(_std_context_columns(test_df)))
+        oof_resid.append(y_test.to_numpy() - pred)
 
         if hasattr(model, "coef_"):
             contrib = X_test * model.coef_
@@ -222,7 +296,9 @@ def _walk_forward(
             all_contribs.append(contrib)
 
     predictions = pl.from_pandas(pd.concat(all_preds, ignore_index=True))
-    margin_std = float(np.std(np.concatenate(resid_train_pool), ddof=1))
+    # Scalar fallback std, now also out-of-fold: this is the honest spread of
+    # the model's error on unseen games, not the flattered in-sample one.
+    margin_std = float(np.std(np.concatenate(oof_resid), ddof=1))
     contributions = pl.from_pandas(pd.concat(all_contribs, ignore_index=True)) if all_contribs else None
 
     logger.info(f"[{model_name}] walk-forward predictions: {predictions.height} games, resid std={margin_std:.2f}")
@@ -238,7 +314,7 @@ def _walk_forward(
 # Context columns pulled back in from modeling_table for the ensemble's own
 # conditional-std fit -- ridge_result/lgbm_result predictions only carry
 # game_id/season/week/teams/margin, not the raw feature columns.
-_STD_CONTEXT_COLS = ["game_id", "elo_diff", "div_game", "game_type", "wind_filled", "is_dome", "rest_diff"]
+_STD_CONTEXT_COLS = ["game_id"] + STD_RAW_CONTEXT_COLS
 
 
 def walk_forward_ensemble(
@@ -255,17 +331,24 @@ def walk_forward_ensemble(
     `model_name` let this same function serve both the margin ensemble and
     the totals ensemble (walk_forward_ensemble_total)."""
     ridge_df = ridge_result.predictions.rename({pred_col: "pred_ridge"})
-    lgbm_df = lgbm_result.predictions.select(["game_id", pred_col]).rename({pred_col: "pred_lgbm"})
-    merged = ridge_df.join(lgbm_df, on="game_id", how="inner").join(
-        modeling_table.select(_STD_CONTEXT_COLS), on="game_id", how="left"
-    )
+    merged = ridge_df
+    if config.ENSEMBLE_INCLUDE_LGBM:
+        lgbm_df = lgbm_result.predictions.select(["game_id", pred_col]).rename({pred_col: "pred_lgbm"})
+        merged = merged.join(lgbm_df, on="game_id", how="inner")
+    merged = merged.join(modeling_table.select(_STD_CONTEXT_COLS), on="game_id", how="left")
 
     seasons = sorted(merged["season"].unique().to_list())
     test_seasons = [s for s in seasons if s >= FIRST_PREDICTABLE_SEASON + 1]
 
     all_preds = []
-    resid_train_pool = []
-    meta_cols = ["pred_ridge", "pred_lgbm"]
+    meta_cols = [c for c in ["pred_ridge", "pred_lgbm"] if c in merged.columns]
+
+    # Same out-of-fold std pool as _walk_forward -- see its comment. The meta
+    # model is only a 2-feature ridge and barely overfits, so this matters
+    # less here than for LightGBM, but there's no reason to leave a known
+    # bias in place on one path and not the other.
+    oof_ctx: list[pl.DataFrame] = []
+    oof_resid: list[np.ndarray] = []
 
     for test_season in test_seasons:
         train_df = merged.filter(pl.col("season") < test_season)
@@ -277,25 +360,31 @@ def walk_forward_ensemble(
         meta = Ridge(alpha=1.0)
         meta.fit(X_train, y_train)
 
-        X_test, _ = _prep_xy(test_df, meta_cols, target_col)
+        X_test, y_test = _prep_xy(test_df, meta_cols, target_col)
         pred = meta.predict(X_test)
-        train_pred = meta.predict(X_train)
-        resid_train = y_train.to_numpy() - train_pred
-        resid_train_pool.append(resid_train)
+
+        n_oof = sum(len(r) for r in oof_resid)
+        if n_oof >= config.MIN_OOF_STD_GAMES:
+            std_fit_df = pl.concat(oof_ctx, how="vertical_relaxed")
+            std_fit_resid = np.concatenate(oof_resid)
+        else:
+            std_fit_df = train_df
+            std_fit_resid = y_train.to_numpy() - meta.predict(X_train)
 
         out = test_df.select(["game_id", "season", "week", "home_team", "away_team", target_col]).to_pandas()
         out[pred_col] = pred
-        out["predicted_std"] = _fit_predict_conditional_std(train_df, test_df, resid_train)
+        out["predicted_std"] = _fit_predict_conditional_std(std_fit_df, test_df, std_fit_resid)
         out["model"] = model_name
         all_preds.append(out)
 
-        logger.info(
-            f"[{model_name}] {test_season}: weight(ridge)={meta.coef_[0]:.2f} weight(lgbm)={meta.coef_[1]:.2f} "
-            f"intercept={meta.intercept_:.2f}"
-        )
+        oof_ctx.append(test_df.select(_std_context_columns(test_df)))
+        oof_resid.append(y_test.to_numpy() - pred)
+
+        weights = " ".join(f"weight({c.replace('pred_', '')})={w:.2f}" for c, w in zip(meta_cols, meta.coef_))
+        logger.info(f"[{model_name}] {test_season}: {weights} intercept={meta.intercept_:.2f}")
 
     predictions = pl.from_pandas(pd.concat(all_preds, ignore_index=True))
-    margin_std = float(np.std(np.concatenate(resid_train_pool), ddof=1))
+    margin_std = float(np.std(np.concatenate(oof_resid), ddof=1))
 
     logger.info(f"[{model_name}] walk-forward predictions: {predictions.height} games, resid std={margin_std:.2f}")
     return WalkForwardResult(predictions=predictions, margin_std=margin_std, feature_cols=meta_cols)
@@ -327,9 +416,29 @@ LIVE_MARKET_COLS = [
 ]
 
 
+def oof_std_pool(
+    modeling_table: pl.DataFrame, wf_result: WalkForwardResult, pred_col: str = "predicted_margin",
+    target_col: str = "home_margin",
+) -> tuple[pl.DataFrame, np.ndarray]:
+    """Rebuild the (context, residual) pair the conditional-std model should
+    be fit on for a LIVE prediction, from a completed walk-forward run's
+    out-of-fold predictions. The live model itself trains on all history with
+    nothing held out, so it has no out-of-fold residuals of its own -- but the
+    walk-forward run over the same features and hyperparameters does, and
+    those are the right estimate of how wrong this model is on a game it has
+    never seen. Using the live model's in-sample residuals here instead is the
+    same scale bug documented in _fit_predict_conditional_std."""
+    resid_df = wf_result.predictions.select(["game_id", target_col, pred_col]).join(
+        modeling_table.select(["game_id"] + STD_RAW_CONTEXT_COLS), on="game_id", how="inner"
+    )
+    resid = (resid_df[target_col] - resid_df[pred_col]).to_numpy()
+    return resid_df.select(_std_context_columns(resid_df)), resid
+
+
 def _predict_upcoming(
     modeling_table: pl.DataFrame, feature_cols: list[str], model_factory,
     target_col: str = "home_margin", pred_col: str = "predicted_margin",
+    wf_result: WalkForwardResult | None = None,
 ) -> pd.DataFrame | None:
     played = modeling_table.filter(pl.col(target_col).is_not_null())
     upcoming = modeling_table.filter(pl.col(target_col).is_null() & pl.col("spread_line").is_not_null())
@@ -347,36 +456,53 @@ def _predict_upcoming(
     X_test = _impute(X_test, medians)
     pred = model.predict(X_test)
 
-    train_pred = model.predict(X_train)
-    resid_train = y_train.to_numpy() - train_pred
+    if wf_result is not None:
+        std_fit_df, std_fit_resid = oof_std_pool(modeling_table, wf_result, pred_col, target_col)
+    else:
+        std_fit_df = played.select(_std_context_columns(played))
+        std_fit_resid = y_train.to_numpy() - model.predict(X_train)
 
     out = upcoming.select(LIVE_MARKET_COLS).to_pandas()
     out[pred_col] = pred
-    out["predicted_std"] = _fit_predict_conditional_std(played, upcoming, resid_train)
+    out["predicted_std"] = _fit_predict_conditional_std(std_fit_df, upcoming, std_fit_resid)
     return out
 
 
-def predict_upcoming_ridge(modeling_table: pl.DataFrame) -> pd.DataFrame | None:
-    return _predict_upcoming(modeling_table, config.MARGIN_MODEL_FEATURES, lambda: Ridge(alpha=config.RIDGE_ALPHA_MARGIN))
-
-
-def predict_upcoming_lgbm(modeling_table: pl.DataFrame) -> pd.DataFrame | None:
-    return _predict_upcoming(modeling_table, gbm_feature_columns(modeling_table), lambda: lgb.LGBMRegressor(**config.LGBM_PARAMS))
-
-
-def predict_upcoming_ridge_total(modeling_table: pl.DataFrame) -> pd.DataFrame | None:
-    """Totals analogue of predict_upcoming_ridge."""
+def predict_upcoming_ridge(
+    modeling_table: pl.DataFrame, wf_result: WalkForwardResult | None = None
+) -> pd.DataFrame | None:
     return _predict_upcoming(
-        modeling_table, config.TOTAL_MODEL_FEATURES, lambda: Ridge(alpha=config.RIDGE_ALPHA_TOTAL),
-        target_col="total_points", pred_col="predicted_total",
+        modeling_table, config.MARGIN_MODEL_FEATURES, lambda: Ridge(alpha=config.RIDGE_ALPHA_MARGIN),
+        wf_result=wf_result,
     )
 
 
-def predict_upcoming_lgbm_total(modeling_table: pl.DataFrame) -> pd.DataFrame | None:
+def predict_upcoming_lgbm(
+    modeling_table: pl.DataFrame, wf_result: WalkForwardResult | None = None
+) -> pd.DataFrame | None:
+    return _predict_upcoming(
+        modeling_table, gbm_feature_columns(modeling_table), lambda: lgb.LGBMRegressor(**config.LGBM_PARAMS),
+        wf_result=wf_result,
+    )
+
+
+def predict_upcoming_ridge_total(
+    modeling_table: pl.DataFrame, wf_result: WalkForwardResult | None = None
+) -> pd.DataFrame | None:
+    """Totals analogue of predict_upcoming_ridge."""
+    return _predict_upcoming(
+        modeling_table, config.TOTAL_MODEL_FEATURES, lambda: Ridge(alpha=config.RIDGE_ALPHA_TOTAL),
+        target_col="total_points", pred_col="predicted_total", wf_result=wf_result,
+    )
+
+
+def predict_upcoming_lgbm_total(
+    modeling_table: pl.DataFrame, wf_result: WalkForwardResult | None = None
+) -> pd.DataFrame | None:
     """Totals analogue of predict_upcoming_lgbm."""
     return _predict_upcoming(
         modeling_table, gbm_total_feature_columns(modeling_table), lambda: lgb.LGBMRegressor(**config.LGBM_PARAMS),
-        target_col="total_points", pred_col="predicted_total",
+        target_col="total_points", pred_col="predicted_total", wf_result=wf_result,
     )
 
 
@@ -396,27 +522,33 @@ def predict_upcoming_ensemble(
     if ridge_live is None or lgbm_live is None or ridge_live.empty or lgbm_live.empty:
         return None
 
-    hist_ridge = ridge_result.predictions.select(["game_id", target_col, pred_col]).rename({pred_col: "pred_ridge"})
-    hist_lgbm = lgbm_result.predictions.select(["game_id", pred_col]).rename({pred_col: "pred_lgbm"})
-    hist = hist_ridge.join(hist_lgbm, on="game_id", how="inner")
+    hist = ridge_result.predictions.select(["game_id", target_col, pred_col]).rename({pred_col: "pred_ridge"})
+    live = ridge_live.rename(columns={pred_col: "pred_ridge"})
+    meta_cols = ["pred_ridge"]
+    if config.ENSEMBLE_INCLUDE_LGBM:
+        hist_lgbm = lgbm_result.predictions.select(["game_id", pred_col]).rename({pred_col: "pred_lgbm"})
+        hist = hist.join(hist_lgbm, on="game_id", how="inner")
+        live = live.merge(lgbm_live[["game_id", pred_col]].rename(columns={pred_col: "pred_lgbm"}), on="game_id")
+        meta_cols.append("pred_lgbm")
 
-    X_train, y_train = _prep_xy(hist, ["pred_ridge", "pred_lgbm"], target_col)
+    X_train, y_train = _prep_xy(hist, meta_cols, target_col)
     meta = Ridge(alpha=1.0)
     meta.fit(X_train, y_train)
-    train_pred = meta.predict(X_train)
-    resid_train = y_train.to_numpy() - train_pred
 
-    live = ridge_live.rename(columns={pred_col: "pred_ridge"}).merge(
-        lgbm_live[["game_id", pred_col]].rename(columns={pred_col: "pred_lgbm"}), on="game_id"
-    )
-    live[pred_col] = meta.predict(live[["pred_ridge", "pred_lgbm"]])
-    live = live.drop(columns=["pred_ridge", "pred_lgbm", "predicted_std"])
+    live[pred_col] = meta.predict(live[meta_cols])
+    live = live.drop(columns=meta_cols + ["predicted_std"])
 
+    # The ensemble's inputs here are already out-of-fold (both base models'
+    # walk-forward predictions), so the meta model's residuals against them
+    # are an honest out-of-sample spread -- unlike a base model's own
+    # in-sample residuals. See _fit_predict_conditional_std.
+    resid = y_train.to_numpy() - meta.predict(X_train)
     hist_ctx = hist.join(modeling_table.select(_STD_CONTEXT_COLS), on="game_id", how="left")
     live_ctx = pl.from_pandas(live[["game_id"]]).join(modeling_table.select(_STD_CONTEXT_COLS), on="game_id", how="left")
-    live["predicted_std"] = _fit_predict_conditional_std(hist_ctx, live_ctx, resid_train)
+    live["predicted_std"] = _fit_predict_conditional_std(hist_ctx, live_ctx, resid)
 
-    logger.info(f"[ensemble live] weight(ridge)={meta.coef_[0]:.2f} weight(lgbm)={meta.coef_[1]:.2f} intercept={meta.intercept_:.2f}")
+    weights = " ".join(f"weight({c.replace('pred_', '')})={w:.2f}" for c, w in zip(meta_cols, meta.coef_))
+    logger.info(f"[ensemble live] {weights} intercept={meta.intercept_:.2f}")
     return live
 
 

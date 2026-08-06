@@ -89,6 +89,45 @@ SEASON_REGRESSION_TO_MEAN = 0.33  # fraction of rating pulled back to 1500 each 
 # season, never leak future games into training or feature computation.
 MIN_TRAIN_SEASONS = 3  # need at least this many prior seasons before predicting
 
+# Held-out seasons: NEVER used to make a keep/revert decision about a feature,
+# hyperparameter, threshold, or model. main.py reports development-era and
+# holdout-era results separately so the holdout stays a real out-of-sample
+# check rather than one more thing the configuration has been fit to.
+#
+# The reason this exists: this file's own history is a long list of features
+# kept or reverted on ATS/ML ROI differences of 0.4-1.6 percentage points,
+# measured on a single 13-season backtest whose bootstrap 95% CI on ROI is
+# about +/-4 points wide at n~2000. Every one of those decisions was
+# individually defensible and collectively they fit the configuration to this
+# particular backtest -- the "MAE-tuned LightGBM destroyed ROI" result below
+# is the clearest symptom: that is what a noise-dominated selection metric
+# looks like, not evidence that MAE is the wrong objective.
+#
+# Rule going forward: make decisions on seasons < HOLDOUT_FIRST_SEASON only,
+# and require a change to move ROI by more than the bootstrap CI width
+# (evaluation.summarize_with_ci) before accepting it. Most single-feature
+# changes will not clear that bar, which is the honest answer.
+HOLDOUT_FIRST_SEASON = 2023
+
+# Weather (temp_filled/wind_filled) is DISABLED as a model feature.
+#
+# Not a modeling result -- a train/serve skew. nflverse's temp/wind are the
+# conditions OBSERVED at the game, populated for 2963/3162 outdoor historical
+# games but for 0/34 upcoming ones (there is no forecast in this data). So the
+# walk-forward backtest trained and scored with real wind speeds, while every
+# live prediction silently got add_game_context_features' fixed 58F/8mph
+# defaults instead. The backtest was measuring a model that knows something
+# the live model does not, which makes it an overstatement of live
+# performance rather than a leak of the target.
+#
+# is_dome is deliberately KEPT: it comes from the stadium/roof, is known
+# months in advance, and is identically available live and historically.
+#
+# To re-enable properly, join a real pre-kickoff weather FORECAST (by stadium
+# and kickoff time) rather than the observed value, so the historical feature
+# matches what is actually knowable before a game.
+WEATHER_FEATURES_DISABLED = ["temp_filled", "wind_filled"]
+
 MARGIN_MODEL_FEATURES = [
     "elo_diff",
     "off_epa_play_ewm_diff",
@@ -103,8 +142,6 @@ MARGIN_MODEL_FEATURES = [
     "div_game",
     "neutral_site",
     "is_dome",
-    "temp_filled",
-    "wind_filled",
     "injury_diff",  # kept for ridge only -- see note below; reverted for LightGBM
     "qb_injury_diff",  # kept for ridge only, same as injury_diff -- see note below
 ]
@@ -126,12 +163,14 @@ TOTAL_MODEL_FEATURES = [
     "def_success_rate_allowed_ewm_sum",
     "qb_epa_per_att_ewm_sum",
     "off_plays_ewm_sum",  # kept for ridge/ensemble only -- see note below; reverted for LightGBM
-    "wind_filled",
-    "temp_filled",
     "is_dome",
     "neutral_site",
     "div_game",
 ]
+# wind_filled/temp_filled removed here too -- see WEATHER_FEATURES_DISABLED.
+# Weather is more plausibly a real totals signal than a margin one (wind
+# suppresses passing for BOTH teams), so this is the feature set most worth
+# revisiting if a genuine forecast source is ever wired in.
 # Phase 1 result, measured directly (main.py's ridge_total/lgbm_total/
 # ensemble_total, evaluation.skill_vs_market_totals): worse than the market
 # on every metric, for every model. Ridge: MAE 10.68 vs 10.51, RMSE 13.50 vs
@@ -444,6 +483,35 @@ TOTAL_MODEL_FEATURES = [
 RIDGE_ALPHA_MARGIN = 5.0
 RIDGE_ALPHA_TOTAL = 5.0
 
+# LightGBM is excluded from the ensemble.
+#
+# Stated honestly: this is a SIMPLIFICATION, not a measured improvement. On
+# the development era, ensemble-with-lgbm vs ridge alone came to ATS -0.3pp
+# (95% CI on the difference [-10.1pp, +9.3pp]) and ML +2.6pp ([-15.6pp,
+# +20.9pp]) -- both firmly inside the noise, which is exactly the kind of
+# difference config.py has historically treated as a result and should not.
+#
+# What is NOT ambiguous is the case for removing it:
+#   - the meta-model already assigns it near-zero weight on its own (0.01-0.10
+#     across seasons, against ridge's 0.79-0.86), so it was contributing
+#     almost nothing even when included;
+#   - standalone it is clearly bad (development ATS ROI -7.3%, ML -2.0%);
+#   - its edge-shrinkage slope is 0.02-0.08 vs ridge's 0.20-0.35, i.e. its
+#     claimed edges are ~10x overstated, so the adaptive threshold has to
+#     demand 10-40 point raw edges from it before a bet clears.
+# Removing a component with no demonstrated value, a bad standalone record,
+# and a near-zero learned weight is justified on parsimony alone.
+#
+# With a single base model the "ensemble" becomes a one-feature meta
+# regression on ridge's prediction -- not degenerate: it still fits a slope
+# and intercept that shrink and de-bias ridge's raw output against realized
+# margins, which is the same correction the edge-shrinkage machinery applies
+# on the betting side.
+#
+# LightGBM still runs and is still reported as a standalone comparison model;
+# this only controls whether it feeds the ensemble.
+ENSEMBLE_INCLUDE_LGBM = False
+
 LGBM_PARAMS = {
     "objective": "regression",
     "metric": "l2",
@@ -474,6 +542,12 @@ DEFAULT_TOTAL_STD = 10.0  # same idea, for the totals model's predicted-total di
 # or wildly oversized std.
 MARGIN_STD_FLOOR = 8.0
 MARGIN_STD_CAP = 22.0
+
+# Minimum accumulated OUT-OF-FOLD residuals before the conditional-std model
+# is fit on them instead of falling back to in-sample residuals (see
+# modeling._walk_forward). Only the earliest walk-forward fold, which has no
+# completed folds behind it, ever hits the fallback.
+MIN_OOF_STD_GAMES = 200
 
 # Walk-forward isotonic recalibration of model probabilities (see
 # probabilities.walk_forward_calibrate): fit only on strictly earlier
@@ -532,10 +606,80 @@ T_DOF_CAP = 100.0
 
 # --- Backtesting ------------------------------------------------------------
 
-ATS_EDGE_THRESHOLD_POINTS = 1.5  # min |model_spread - market_spread| to place an ATS bet
-ML_EDGE_THRESHOLD_PROB = 0.03  # min |model_prob - no_vig_market_prob| to place an ML bet
+# --- Edge shrinkage: the central correction in this file ---------------------
+#
+# A model's RAW edge (predicted_margin - spread_line) is not an estimate of
+# its true edge, and treating it as one is what made every threshold here too
+# permissive. Measured directly (probabilities.fit_edge_shrinkage_walk_forward,
+# regressing realized home_margin - spread_line on the raw edge):
+#
+#   ridge     slope 0.203   corr +0.048
+#   ensemble  slope 0.181   corr +0.039
+#   lgbm      slope 0.087   corr +0.032
+#
+# i.e. when ridge claims a +5 point edge, the true expected edge is +1.0
+# points. The signal is real (t ~ 2.9, not zero) but it is roughly 5x smaller
+# than the raw number says. The old ATS_EDGE_THRESHOLD_POINTS = 1.5 therefore
+# admitted every game whose TRUE edge was as low as 0.3 points, and
+# sd(home_margin - spread_line) ~ 12.9 means beating -110 needs a true edge of
+# about 0.77 points -- so roughly half of all bets placed were structurally
+# negative-expectation before a single game was played.
+#
+# The old fixed thresholds' own edge buckets show exactly that (ridge ATS):
+#   (1.5, 3]  n=1057  win 49.5%  ROI  -3.8%   <- half the book, -EV by design
+#   (3, 5]    n= 716  win 55.2%  ROI  +6.8%
+#   (5, 8]    n= 291  win 54.0%  ROI  +5.3%
+#   (8, inf]  n=  58  win 56.9%  ROI +10.9%
+#
+# Rather than hardcode "3.5" (which would just be fitting a constant to that
+# same backtest), the threshold is now DERIVED each season from two
+# walk-forward quantities: the shrinkage slope above, and the break-even win
+# rate implied by the actual odds being offered. See
+# backtesting.adaptive_ats_threshold. Independent confirmation that this lands
+# in the right place: the repo's own optimal_threshold_walk_forward, which
+# never sees the test season, picked 3.0-4.75 in 10 of 10 seasons.
+USE_ADAPTIVE_THRESHOLDS = True
+
+# Fallback fixed thresholds, used when USE_ADAPTIVE_THRESHOLDS is False or
+# before enough history exists to fit a shrinkage slope. Both raised from
+# their old values (1.5 / 0.03) to sit near what the adaptive rule and the
+# walk-forward optimizer independently converge on.
+ATS_EDGE_THRESHOLD_POINTS = 3.5  # min |model_spread - market_spread| to place an ATS bet
+ML_EDGE_THRESHOLD_PROB = 0.10  # min |model_prob - no_vig_market_prob| to place an ML bet
+
+# Minimum prior graded games before a shrinkage slope is trusted; below this,
+# fall back to the fixed thresholds above.
+MIN_SHRINKAGE_GAMES = 300
+# Guard rails on the fitted slope. A near-zero or negative slope means the
+# model has no measurable edge over the line that season -- clamping to a
+# small positive floor turns that into "demand an enormous raw edge" (i.e.
+# bet almost nothing) rather than a divide-by-zero or a nonsensical negative
+# threshold.
+SHRINKAGE_SLOPE_FLOOR = 0.02
+SHRINKAGE_SLOPE_CAP = 1.0
+
+# Moneyline: restrict to underdog-side bets only.
+#
+# Measured directly against a blind "bet the underdog in these same games"
+# benchmark, which is the control this needs to beat to have added anything:
+#   thr=0.03  model -2.6%  |  blind-dog on same games -3.6%
+#   thr=0.08  model +2.8%  |  blind-dog on same games +0.9%
+#   thr=0.12  model +5.1%  |  blind-dog on same games +4.6%
+# Split by side, at every threshold tested, the model's underdog bets carried
+# all of the return (+7.5% at thr=0.12) and its favorite bets lost money
+# (-2.1%). That is consistent with the model being a WORSE probability
+# estimator than the market in aggregate (Brier 0.217 vs the market's 0.211):
+# where it disagrees with the line on a favorite, the line is usually right.
+# Blind-dog across ALL games is -5.2%, so this is not a generic underdog
+# bias -- the game SELECTION carries real information, the side choice on
+# favorites does not.
+ML_UNDERDOG_ONLY = True
+
 TOTAL_EDGE_THRESHOLD_POINTS = 1.5  # min |model_total - market_total| to place a totals bet -- phase-1 starting
-# point, same magnitude as ATS_EDGE_THRESHOLD_POINTS; untuned, not yet checked with the threshold optimizer.
+# point; untuned. Totals showed no edge over the market at all (see
+# TOTAL_MODEL_FEATURES' note), so it is deliberately left on the old fixed
+# rule rather than given the adaptive treatment -- there is no measured edge
+# for a shrinkage slope to scale.
 FLAT_STAKE_UNITS = 1.0
 DEFAULT_SPREAD_ODDS = -110  # American odds fallback when spread_odds is missing
 

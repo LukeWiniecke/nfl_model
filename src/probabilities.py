@@ -136,6 +136,82 @@ def fit_t_dof_walk_forward(df, actual_col: str, predicted_col: str, std_col: str
     return out
 
 
+def fit_edge_shrinkage_walk_forward(df, edge_col: str, resid_col: str) -> tuple[np.ndarray, np.ndarray]:
+    """How much of the model's claimed edge is real?
+
+    Regresses the REALIZED result against the line (`resid_col`, i.e.
+    home_margin - spread_line) on the model's RAW claimed edge (`edge_col`,
+    i.e. predicted_margin - spread_line), fit for each season on strictly
+    EARLIER seasons only -- same walk-forward rule as walk_forward_calibrate
+    and the conditional-std model.
+
+    The slope is the fraction of a claimed edge that survives contact with
+    reality: a slope of 1.0 would mean the model's edge is exactly right, 0.0
+    that it is pure noise. Measured here it is ~0.20 for ridge, ~0.09 for
+    LightGBM -- so a claimed 5-point edge is really worth about 1 point. That
+    is the number every bet-selection threshold in this project was
+    implicitly assuming was 1.0.
+
+    Fit through the origin (no intercept) deliberately: the market is very
+    close to unbiased, so the fitted intercept is negligible (measured:
+    +0.002 for ridge, -0.007 for the ensemble, +0.04 for LightGBM), and
+    dropping it keeps the resulting bet rule symmetric between the home and
+    away side, which _bet_side assumes.
+
+    Returns (slope, resid_sd) as one value per row of `df`, constant within a
+    season. `resid_sd` is the walk-forward std of the residual-against-line,
+    which adaptive_ats_threshold needs to convert a target win rate into
+    points. Seasons without config.MIN_SHRINKAGE_GAMES of prior history get
+    NaN in both, signalling the caller to fall back to a fixed threshold.
+    """
+    edge = df[edge_col].to_numpy(dtype=float)
+    resid = df[resid_col].to_numpy(dtype=float)
+    season = df["season"].to_numpy()
+
+    slope_out = np.full(len(df), np.nan)
+    sd_out = np.full(len(df), np.nan)
+
+    for s in np.unique(season):
+        train_mask = (season < s) & np.isfinite(edge) & np.isfinite(resid)
+        if train_mask.sum() < config.MIN_SHRINKAGE_GAMES:
+            continue
+        e, r = edge[train_mask], resid[train_mask]
+        denom = float(np.dot(e, e))
+        if denom <= 0:
+            continue
+        slope = float(np.dot(e, r) / denom)
+        test_mask = season == s
+        slope_out[test_mask] = np.clip(slope, config.SHRINKAGE_SLOPE_FLOOR, config.SHRINKAGE_SLOPE_CAP)
+        sd_out[test_mask] = float(np.std(r, ddof=1))
+
+    return slope_out, sd_out
+
+
+def fit_edge_shrinkage_all_history(edge: np.ndarray, resid: np.ndarray) -> tuple[float, float]:
+    """Live-prediction analogue of fit_edge_shrinkage_walk_forward: one slope
+    and one residual sd fit on ALL graded history, for application to the
+    current batch of upcoming games. Returns (nan, nan) if there isn't enough
+    history yet."""
+    edge = np.asarray(edge, dtype=float)
+    resid = np.asarray(resid, dtype=float)
+    ok = np.isfinite(edge) & np.isfinite(resid)
+    if ok.sum() < config.MIN_SHRINKAGE_GAMES:
+        return float("nan"), float("nan")
+    e, r = edge[ok], resid[ok]
+    denom = float(np.dot(e, e))
+    if denom <= 0:
+        return float("nan"), float("nan")
+    slope = float(np.clip(np.dot(e, r) / denom, config.SHRINKAGE_SLOPE_FLOOR, config.SHRINKAGE_SLOPE_CAP))
+    return slope, float(np.std(r, ddof=1))
+
+
+def breakeven_probability(american_odds: np.ndarray) -> np.ndarray:
+    """Win rate a bet at these odds must hit just to break even: 1/(1+b),
+    where b is profit per unit staked. -110 gives 0.5238."""
+    b = american_payout_multiplier(american_odds)
+    return 1.0 / (1.0 + b)
+
+
 def market_moneyline_no_vig(home_moneyline: np.ndarray, away_moneyline: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """De-vig the market's home/away moneylines into a fair two-way probability."""
     home_raw = american_to_prob(home_moneyline)

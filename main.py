@@ -49,6 +49,13 @@ def run_model(name: str, modeling_table: pl.DataFrame, result: modeling.WalkForw
     # a way that manufactures spurious underdog "edges." ATS is unaffected by
     # this either way (bet_side there is decided by the points-based edge, not
     # this probability), so calibration stays on for ATS across all models.
+    #
+    # NOTE: that per-model split was diagnosed BEFORE the conditional-std bug
+    # was found (modeling._fit_predict_conditional_std). LightGBM's raw
+    # probabilities were overconfident because its predicted_std was ~50% too
+    # small, not because isotonic is inherently wrong for it. Now that the std
+    # is fit out-of-fold, this exception is a candidate for removal -- but it
+    # needs re-measuring on the DEVELOPMENT era only before being changed.
     ml_bets = evaluation.add_bet_context(
         backtesting.build_ml_bets(preds_with_market, result.margin_std, calibrate=(name != "lgbm"))
     )
@@ -57,6 +64,14 @@ def run_model(name: str, modeling_table: pl.DataFrame, result: modeling.WalkForw
     ml_summary = backtesting.summarize(ml_bets)
     logger.info(f"[{name}] ATS: {ats_summary}")
     logger.info(f"[{name}] ML:  {ml_summary}")
+
+    for label, bets in [("ATS", ats_bets), ("ML", ml_bets)]:
+        era = evaluation.summarize_by_era(bets)
+        for row in era.iter_rows(named=True):
+            logger.info(
+                f"[{name}] {label} {row['era']:<11}: n={row['n_bets']:4d} roi={row['roi']:+.4f} "
+                f"95% CI=[{row['ci_lo']:+.4f}, {row['ci_hi']:+.4f}]"
+            )
 
     result.predictions.write_parquet(config.MODEL_RESULTS_DIR / f"{name}_predictions.parquet")
     ats_bets.write_parquet(config.BACKTESTS_DIR / f"{name}_ats_bets.parquet")
@@ -71,6 +86,7 @@ def run_model(name: str, modeling_table: pl.DataFrame, result: modeling.WalkForw
             evaluation.summarize_by_edge_bucket,
             evaluation.summarize_by_spread_bucket,
             evaluation.summarize_by_week_bucket,
+            evaluation.summarize_by_era,
         ]:
             df = slicer(bets)
             out_path = config.BACKTESTS_DIR / f"{name}_{label}_by_{slicer.__name__.replace('summarize_by_', '')}.csv"
@@ -218,9 +234,14 @@ def main():
         logger.info(f"{name} | TOTAL n={r['total']['n_bets']} roi={r['total']['roi']:.3f} win_rate={r['total']['win_rate']:.3f}")
 
     logger.info("=== Upcoming picks (games with no result yet, but a posted market line) ===")
+    # Each walk-forward result is passed through so the live conditional-std
+    # model is fit on that model's OUT-OF-FOLD residuals. The live model
+    # itself trains on all history with nothing held out, so its own residuals
+    # are in-sample and would understate its true error -- the same bug fixed
+    # inside _walk_forward. See modeling.oof_std_pool.
     live_by_model = {
-        "ridge_baseline": modeling.predict_upcoming_ridge(modeling_table),
-        "lgbm": modeling.predict_upcoming_lgbm(modeling_table),
+        "ridge_baseline": modeling.predict_upcoming_ridge(modeling_table, ridge_result),
+        "lgbm": modeling.predict_upcoming_lgbm(modeling_table, lgbm_result),
     }
     live_by_model["ensemble"] = modeling.predict_upcoming_ensemble(
         modeling_table, ridge_result, lgbm_result, live_by_model["ridge_baseline"], live_by_model["lgbm"]
@@ -229,8 +250,8 @@ def main():
     # Totals live predictions -- display only (predicted_total, folded into a
     # derived predicted score below), not a betting market of its own yet.
     live_total_by_model = {
-        "ridge_baseline": modeling.predict_upcoming_ridge_total(modeling_table),
-        "lgbm": modeling.predict_upcoming_lgbm_total(modeling_table),
+        "ridge_baseline": modeling.predict_upcoming_ridge_total(modeling_table, ridge_total_result),
+        "lgbm": modeling.predict_upcoming_lgbm_total(modeling_table, lgbm_total_result),
     }
     live_total_by_model["ensemble"] = modeling.predict_upcoming_ensemble_total(
         modeling_table, ridge_total_result, lgbm_total_result,

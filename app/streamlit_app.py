@@ -547,8 +547,10 @@ with tab_upcoming:
         else:
             edge_col, prob_col, home_odds_col, away_odds_col = "ml_edge", "model_home_prob", "home_moneyline", "away_moneyline"
 
-        # Same _bet_side rule as backtesting.py, applied live at the sidebar's threshold slider.
-        pdf["bet_side"] = np.where(pdf[edge_col] > threshold, "home", np.where(pdf[edge_col] < -threshold, "away", "none"))
+        # Same selection rule as backtesting.py, applied live at the sidebar's
+        # threshold slider -- routed through the shared helper so the moneyline
+        # underdog-only restriction can't go missing here.
+        pdf["bet_side"] = backtesting.decide_bet_side(pdf, market, threshold)
 
         is_home = pdf["bet_side"] == "home"
         prob_for_side = np.where(is_home, pdf[prob_col], 1.0 - pdf[prob_col])
@@ -637,7 +639,7 @@ with tab_track_record:
             home_odds_col = "home_spread_odds" if market == "ats" else "home_moneyline"
             away_odds_col = "away_spread_odds" if market == "ats" else "away_moneyline"
 
-            pdf["bet_side"] = np.where(pdf[edge_col] > threshold, "home", np.where(pdf[edge_col] < -threshold, "away", "none"))
+            pdf["bet_side"] = backtesting.decide_bet_side(pdf, market, threshold)
             if market == "ats":
                 home_right = pdf["home_margin"] > pdf["spread_line"]
             else:

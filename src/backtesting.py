@@ -13,9 +13,13 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+from scipy.stats import norm
+
 from . import config
 from .probabilities import (
     ats_cover_probability_t,
+    breakeven_probability,
+    fit_edge_shrinkage_walk_forward,
     fit_t_dof_walk_forward,
     home_win_probability_t,
     kelly_fraction,
@@ -28,8 +32,65 @@ from .utils import american_payout_multiplier, get_logger
 logger = get_logger(__name__)
 
 
-def _bet_side(edge: np.ndarray, threshold: float) -> np.ndarray:
+def _bet_side(edge: np.ndarray, threshold) -> np.ndarray:
+    """`threshold` may be a scalar or a per-row array -- the adaptive rule
+    (adaptive_ats_threshold) produces a different bar for each game, while the
+    dashboard's slider and the walk-forward threshold optimizer both still
+    pass a single number. np.where broadcasts either way."""
     return np.where(edge > threshold, "home", np.where(edge < -threshold, "away", "none"))
+
+
+def decide_bet_side(df: pd.DataFrame, market: str, threshold) -> np.ndarray:
+    """The single source of truth for "which side, if any, do we bet".
+
+    Exists because the selection rule is applied in four places (the ATS
+    regrade, the ML regrade, and two ad-hoc spots in the dashboard that
+    recompute it at the sidebar's threshold), and the moneyline underdog-only
+    restriction was silently missing from the dashboard copies -- so the app
+    would show favorite ML picks the backtest would never have placed.
+    """
+    edge_col = "ats_edge" if market == "ats" else "ml_edge"
+    side = _bet_side(df[edge_col].to_numpy(), threshold)
+    if market == "ml" and config.ML_UNDERDOG_ONLY:
+        favorite_side = np.where(df["spread_line"].to_numpy() > 0, "home", "away")
+        side = np.where(side == favorite_side, "none", side)
+    return side
+
+
+def adaptive_ats_threshold(df: pd.DataFrame) -> np.ndarray:
+    """Per-game minimum RAW edge required to place an ATS bet, derived rather
+    than hardcoded. Three steps, all walk-forward:
+
+      1. How much of a claimed edge is real? -> shrinkage slope b
+         (probabilities.fit_edge_shrinkage_walk_forward).
+      2. What true edge, in points, clears the vig at THIS game's actual
+         price? break-even win rate p* from the offered odds, converted to
+         points via the walk-forward sd of home_margin - spread_line:
+         true_edge_needed = Phi^-1(p*) * sd.
+      3. Convert back to the raw scale the model actually reports:
+         raw_needed = true_edge_needed / b.
+
+    Worked example at the measured values: p* = 0.5238 at -110, sd = 12.86 ->
+    a true edge of 0.77 points is needed; ridge's slope of 0.203 turns that
+    into a raw-edge bar of 3.79 points. The old fixed threshold was 1.5.
+
+    Returned on the RAW edge scale on purpose: `ats_edge` keeps meaning
+    exactly what it always did, so the dashboard's slider, the edge-bucket
+    breakdowns, and optimal_threshold_walk_forward all keep working unchanged
+    and stay comparable to previously saved runs.
+    """
+    slope, sd = fit_edge_shrinkage_walk_forward(df, "ats_edge", "_ats_resid")
+
+    # Use the worse (more expensive) of the two sides' prices, so a game is
+    # only bet if it clears the bar at the price actually available.
+    home_odds = df["home_spread_odds"].fillna(config.DEFAULT_SPREAD_ODDS).to_numpy()
+    away_odds = df["away_spread_odds"].fillna(config.DEFAULT_SPREAD_ODDS).to_numpy()
+    p_breakeven = np.maximum(breakeven_probability(home_odds), breakeven_probability(away_odds))
+
+    true_edge_needed = norm.ppf(p_breakeven) * sd
+    raw_needed = true_edge_needed / slope
+
+    return np.where(np.isfinite(raw_needed), raw_needed, config.ATS_EDGE_THRESHOLD_POINTS)
 
 
 def _totals_side(edge: np.ndarray, threshold: float) -> np.ndarray:
@@ -45,7 +106,7 @@ def regrade_ats(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
     # misaligns (and raises) against df's own index unless it's already 0..n-1 --
     # true for a full to_pandas() conversion but not for an arbitrary filtered slice.
     df = df.reset_index(drop=True)
-    df["bet_side"] = _bet_side(df["ats_edge"].to_numpy(), threshold)
+    df["bet_side"] = decide_bet_side(df, "ats", threshold)
 
     is_push = np.isclose(df["home_margin"], df["spread_line"])
     home_covers = df["home_margin"] > df["spread_line"]
@@ -77,12 +138,27 @@ def regrade_ats(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
     return df
 
 
-def regrade_ml(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+def regrade_ml(df: pd.DataFrame, threshold, underdog_only: bool | None = None) -> pd.DataFrame:
     """Same idea as regrade_ats, for the moneyline market: given a table that
     already has `ml_edge`, `home_margin`, and moneylines, (re)decide bet_side
-    at `threshold` and grade it."""
+    at `threshold` and grade it.
+
+    `underdog_only` (defaulting to config.ML_UNDERDOG_ONLY) drops any bet that
+    would land on the market favorite. See that constant's note: split by
+    side, the model's favorite-side moneyline bets lost money at every
+    threshold tested, while its underdog bets carried the entire return.
+    """
     df = df.reset_index(drop=True)  # see regrade_ats -- bet_won needs a clean 0..n-1 index to align against
-    df["bet_side"] = _bet_side(df["ml_edge"].to_numpy(), threshold)
+    if underdog_only is None or underdog_only == config.ML_UNDERDOG_ONLY:
+        df["bet_side"] = decide_bet_side(df, "ml", threshold)
+    else:
+        # Explicit override (used to A/B the restriction itself); spread_line
+        # > 0 means the HOME team is favored, so the underdog is away.
+        side = _bet_side(df["ml_edge"].to_numpy(), threshold)
+        if underdog_only:
+            favorite_side = np.where(df["spread_line"].to_numpy() > 0, "home", "away")
+            side = np.where(side == favorite_side, "none", side)
+        df["bet_side"] = side
 
     is_tie = df["home_margin"] == 0
     home_wins = df["home_margin"] > 0
@@ -135,7 +211,34 @@ def build_ats_bets(preds_with_market: pl.DataFrame, margin_std: float) -> pl.Dat
     df["model_cover_prob_raw"] = ats_cover_probability_t(df["predicted_margin"], df["spread_line"], std, dof)
     home_covers = (df["home_margin"] > df["spread_line"]).to_numpy().astype(float)
     df["model_cover_prob"] = walk_forward_calibrate(df, "model_cover_prob_raw", home_covers)
-    df = regrade_ats(df, config.ATS_EDGE_THRESHOLD_POINTS)
+
+    # Realized result against the line -- the thing the raw edge is supposed
+    # to predict, and the target the shrinkage slope is fit against.
+    df["_ats_resid"] = df["home_margin"] - df["spread_line"]
+    slope, _ = fit_edge_shrinkage_walk_forward(df, "ats_edge", "_ats_resid")
+    df["ats_edge_shrinkage"] = slope
+    # The model's HONEST expected edge in points, as opposed to its claimed
+    # one. Not used for bet selection directly (the threshold is converted to
+    # the raw scale instead, so ats_edge keeps its historical meaning), but
+    # it is the number actually worth looking at on a pick.
+    df["ats_edge_shrunk"] = df["ats_edge"] * slope
+
+    if config.USE_ADAPTIVE_THRESHOLDS:
+        threshold = adaptive_ats_threshold(df)
+        df["ats_threshold_used"] = threshold
+        finite = np.isfinite(slope)
+        if finite.any():
+            logger.info(
+                f"[ats] adaptive threshold: median={np.nanmedian(threshold):.2f} pts "
+                f"(shrinkage slope median={np.nanmedian(slope[finite]):.3f}); "
+                f"fixed fallback would be {config.ATS_EDGE_THRESHOLD_POINTS}"
+            )
+    else:
+        threshold = config.ATS_EDGE_THRESHOLD_POINTS
+        df["ats_threshold_used"] = threshold
+
+    df = df.drop(columns=["_ats_resid"])
+    df = regrade_ats(df, threshold)
     return pl.from_pandas(df)
 
 

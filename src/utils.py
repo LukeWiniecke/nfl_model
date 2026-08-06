@@ -9,6 +9,13 @@ import numpy as np
 def get_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
     if not logger.handlers:
+        # Force UTF-8 on the stream: polars renders its tables with box-drawing
+        # characters, which a default cp1252 Windows console cannot encode --
+        # every logged DataFrame (e.g. main.py's skill-vs-market tables) raised
+        # a UnicodeEncodeError inside logging and printed a traceback instead
+        # of the table. errors="replace" keeps that from ever being fatal.
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(message)s", "%H:%M:%S"))
         logger.addHandler(handler)
