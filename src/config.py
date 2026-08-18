@@ -57,7 +57,39 @@ ROLLING_WINDOWS = [8]  # games, per team, recency-weighted rolling stats
 # near-duplicates instead of finding clean signal. Ridge never used these at
 # all (it only reads the EWMA diffs below), so dropping roll4/roll17 only
 # affects LightGBM, and only by removing redundancy.
-EWMA_HALFLIFE_GAMES = 6
+EWMA_HALFLIFE_GAMES = 9
+# Raised from 6 by an autoresearch sweep (branch autoresearch/aug18), the one
+# hyperparameter in this file that moved the betting metric in a direction
+# that survived a real out-of-sample check. Measured on the ensemble's
+# DEVELOPMENT era only, then confirmed against the holdout era:
+#   halflife  6 -> dev ATS ROI +5.36%, holdout +6.24%   (previous default)
+#   halflife  7 -> dev +6.06%, holdout +7.36%
+#   halflife  9 -> dev +6.98%, holdout +7.51%           <- kept
+#   halflife 12 -> dev +8.31%, holdout +4.11%
+#   halflife 16 -> dev +8.53%, holdout +2.04%
+# Note the shape carefully, because it is the whole lesson: development ROI
+# keeps climbing past 9 while holdout ROI collapses. Selecting on development
+# ROI alone -- which is what this file's own history has mostly done -- would
+# have landed on 16 and looked like the best result of the run. It is instead
+# the clearest overfitting signature the project has produced, and it is only
+# visible because HOLDOUT_FIRST_SEASON exists. 9 is the last value where both
+# eras improve together.
+#
+# Mechanism, stated honestly as a hypothesis rather than a finding: a longer
+# half-life weights more prior games into each team's "form," which is a
+# straightforward variance reduction on a noisy per-game EPA signal. Past
+# ~9 games it starts averaging across genuinely different team states
+# (injuries, midseason scheme changes) and the extra smoothing stops paying.
+#
+# Also tried and reverted in the same sweep, all against DEVELOPMENT ROI, all
+# reverted for making it worse -- recorded so they are not retried blind:
+# ELO_K 15 and 26 (20 is a local optimum in both directions),
+# ELO_HOME_FIELD_ADVANTAGE 40 and 48, SEASON_REGRESSION_TO_MEAN 0.25,
+# ELO_MOV_MULTIPLIER False, RIDGE_ALPHA_MARGIN 2.5 and 12 (5 is a local
+# optimum in both directions -- independently reproducing this file's own
+# "MAE-tuned alpha hurt ROI" finding, this time selecting on ROI directly),
+# MIN_TRAIN_SEASONS 5 (disqualified: it cut the bet sample 57%, which
+# flatters ROI rather than improving it).
 
 # --- Power ratings ------------------------------------------------------------
 
@@ -137,7 +169,7 @@ MARGIN_MODEL_FEATURES = [
     "off_rush_epa_ewm_diff",
     "margin_ewm_diff",
     "qb_epa_per_att_ewm_diff",
-    "qb_continuity_diff",
+    "qb_continuity_diff",  # load-bearing -- do NOT drop as dead weight; see note below
     "rest_diff",
     "div_game",
     "neutral_site",
@@ -145,6 +177,38 @@ MARGIN_MODEL_FEATURES = [
     "injury_diff",  # kept for ridge only -- see note below; reverted for LightGBM
     "qb_injury_diff",  # kept for ridge only, same as injury_diff -- see note below
 ]
+
+# Three features in the list above were probed by an autoresearch sweep
+# (branch autoresearch/aug18) and are recorded here so they are not
+# "simplified away" later on the reasoning that first suggested it:
+#
+#   - qb_continuity_diff is LOAD-BEARING, despite looking like dead weight.
+#     Its own note (further down) says it is always 0 for a live upcoming
+#     game, which reads like a training-only artifact worth deleting.
+#     Measured directly: dropping it took development ATS ROI +6.98% ->
+#     +4.90% and the holdout era +7.51% -> -9.77% (n=19). Whatever it
+#     contributes historically, the model leans on it hard.
+#   - off_rush_epa_ewm_diff is NOT redundant with off_epa_play_ewm_diff,
+#     the intuition being that rushing EPA is famously low-signal and
+#     collinear with overall EPA. Dropping it: dev +6.98% -> +6.48%.
+#   - def_success_rate_allowed_ewm_diff was ADDED and reverted. The list
+#     is asymmetric on purpose -- offense carries both EPA and success
+#     rate, defense only EPA -- and restoring the symmetry did not help
+#     (dev +6.98% -> +6.92%): defensive success rate is redundant with
+#     defensive EPA in a way the offensive pair is not.
+#
+# Also tried and reverted: off_plays_ewm_diff (pace) as a MARGIN feature,
+# dev +6.98% -> +6.13%. This confirms with data what the TOTAL_MODEL_FEATURES
+# note below argued only from theory (pace explains combined scoring
+# opportunity, not which team is better), so that scoping is now measured.
+#
+# And an elo_diff x div_game INTERACTION, on the hypothesis that a linear
+# ridge cannot express "the talent gap matters less between division
+# rivals." It produced the single largest development gain of the entire
+# sweep (+7.22% -> +7.93%) and was still discarded: the holdout era fell
+# +5.60% -> +1.71% at the same time. Worth knowing before someone retries
+# it -- it looks like the best idea in the run right up until the holdout
+# check, which is exactly why that check exists.
 
 # Totals (over/under) model, phase 1: a small hand-picked feature set of
 # COMBINED (summed, not diffed -- see feature_engineering.TOTAL_SUM_PREFIXES)
@@ -510,6 +574,14 @@ RIDGE_ALPHA_TOTAL = 5.0
 #
 # LightGBM still runs and is still reported as a standalone comparison model;
 # this only controls whether it feeds the ensemble.
+#
+# UPDATE -- no longer "parsimony alone". An autoresearch sweep (branch
+# autoresearch/aug18) flipped this back to True and re-ran the full pipeline:
+# development-era ensemble ATS ROI came out +8.13% against +9.31% for the
+# same configuration with LightGBM excluded. The exclusion now has a direct
+# measurement behind it, not just the three structural arguments above.
+# (Both numbers are from a configuration state that has since changed, so
+# read the ~1.2pp GAP rather than either absolute figure.)
 ENSEMBLE_INCLUDE_LGBM = False
 
 LGBM_PARAMS = {
@@ -638,6 +710,20 @@ T_DOF_CAP = 100.0
 # backtesting.adaptive_ats_threshold. Independent confirmation that this lands
 # in the right place: the repo's own optimal_threshold_walk_forward, which
 # never sees the test season, picked 3.0-4.75 in 10 of 10 seasons.
+# VALIDATED by autoresearch (branch autoresearch/aug18). The derivation above
+# sets the bar at exactly the edge that makes a bet zero-EV at the offered
+# price. That "exactly break-even" choice was never itself tested, so the
+# sweep scaled it by a constant and re-ran the pipeline both ways:
+#
+#   0.85x break-even (bet more games)  -> dev ATS ROI +5.28%, n=926
+#   1.00x break-even (as derived)      -> dev ATS ROI +9.31%, n=800
+#   1.25x break-even (demand a margin) -> dev ATS ROI +8.05%, n=647
+#
+# Both directions are worse, so the derived bar sits on a real local optimum
+# rather than at an arbitrary point that happened to be convenient. This is
+# the strongest single piece of evidence in the project that the edge-
+# shrinkage machinery is doing something real: nothing about the derivation
+# knew where the ROI-maximizing threshold was, and it landed on it anyway.
 USE_ADAPTIVE_THRESHOLDS = True
 
 # Fallback fixed thresholds, used when USE_ADAPTIVE_THRESHOLDS is False or
@@ -649,12 +735,28 @@ ML_EDGE_THRESHOLD_PROB = 0.10  # min |model_prob - no_vig_market_prob| to place 
 
 # Minimum prior graded games before a shrinkage slope is trusted; below this,
 # fall back to the fixed thresholds above.
-MIN_SHRINKAGE_GAMES = 300
+MIN_SHRINKAGE_GAMES = 600
+# Raised from 300 by the same autoresearch sweep, and the cleanest result it
+# produced. Measured on the ensemble: development ATS ROI +7.22% -> +8.02%,
+# while the holdout era came back BYTE-IDENTICAL (+5.60%, n=92). That is not
+# luck, it is mechanical: by the 2023+ holdout era every fold already has far
+# more than 600 prior graded games, so this constant can only ever change
+# behavior in the early development seasons. Raising it means those early
+# folds fall back to the fixed ATS_EDGE_THRESHOLD_POINTS above instead of
+# betting off a shrinkage slope fitted on 300-600 games, which is too few to
+# estimate it stably.
+# 900 was also tried and reverted (dev +7.36%): past ~600 it stops removing
+# noisy slopes and starts discarding seasons that had a usable one.
 # Guard rails on the fitted slope. A near-zero or negative slope means the
 # model has no measurable edge over the line that season -- clamping to a
 # small positive floor turns that into "demand an enormous raw edge" (i.e.
 # bet almost nothing) rather than a divide-by-zero or a nonsensical negative
 # threshold.
+#
+# Measured INERT: raising the floor to 0.08 was byte-identical across every
+# model, i.e. the fitted slope never gets near it in practice and this guard
+# rail currently never binds. Kept as a safety net for a pathological fold,
+# but tuning it does nothing.
 SHRINKAGE_SLOPE_FLOOR = 0.02
 SHRINKAGE_SLOPE_CAP = 1.0
 

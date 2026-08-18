@@ -1,0 +1,11 @@
+Model:                  ensemble
+Dev ATS ROI:            +0.0791
+Dev ATS n_bets:         691
+Dev ATS 95% CI:         [+0.0082, +0.1502]
+Holdout ATS ROI:        +0.0751
+Holdout ATS n_bets:     94
+Dev ML ROI:             +0.1235
+Dev ML n_bets:          492
+Dev ML 95% CI:          [+0.0001, +0.2473]
+Holdout ML ROI:         +0.0389
+Holdout ML n_bets:      149

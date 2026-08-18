@@ -11,3 +11,8 @@ run_log.txt
 
 # Runtime logs (streamlit server, scheduled refresh runs)
 logs/
+
+# Autoresearch loop: per-run log and experiment ledger are local/untracked;
+# only summary.txt (committed each iteration) is meant to survive in git.
+run.log
+results.tsv

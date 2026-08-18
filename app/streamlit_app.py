@@ -1269,7 +1269,8 @@ playoffs, no preseason -- 2010 is where moneyline/spread-odds coverage in this s
 
 1. **Cleaning** (`cleaning.py`): standardizes relocated franchises' abbreviations (OAK->LV, SD->LAC, STL->LA) so
    rolling stats and Elo track one franchise across a move.
-2. **Features** (`feature_engineering.py`): an 8-game rolling window and an EWMA (6-game half-life) of
+2. **Features** (`feature_engineering.py`): an 8-game rolling window and an EWMA
+   ({config.EWMA_HALFLIFE_GAMES}-game half-life) of
    EPA/success-rate form per team, **QB-level form** (the starting QB each game -- most pass attempts for that
    team -- tracked with their own rolling EPA/dropback across team changes, plus a starter-continuity flag), an
    **injury feature** (ridge only -- a severity-weighted count of each team's official pre-game injury-report
@@ -1287,9 +1288,14 @@ playoffs, no preseason -- 2010 is where moneyline/spread-odds coverage in this s
    - **Ridge baseline**: ~15 hand-picked features (Elo diff, a few EWMA form diffs, QB EWMA diff + continuity,
      rest, weather, neutral site).
    - **LightGBM**: the full engineered feature set.
-   - **Ensemble**: a 2-feature meta-regression blending ridge's and LightGBM's predicted margins, itself refit
-     walk-forward each season so the blend weight can shift toward whichever model has actually been more
-     accurate so far, rather than a fixed split.
+   - **Ensemble**: a meta-regression on the base models' predicted margins, refit walk-forward each season so
+     the blend can shift toward whichever model has actually been more accurate so far, rather than a fixed
+     split. LightGBM is currently **excluded** from the blend (`config.ENSEMBLE_INCLUDE_LGBM = False`), so this
+     is a one-feature regression on ridge's prediction -- still not degenerate: it fits a slope and intercept
+     that shrink and de-bias ridge's raw output against realized margins. Excluding LightGBM was originally a
+     parsimony call, but has since been **measured directly** in an autoresearch sweep: re-including LightGBM
+     lowered development-era ATS ROI by roughly a point, so the exclusion is now backed by data rather than
+     judgment.
 5. **Probabilities** (`probabilities.py`): a normal distribution around the predicted margin gives both the ATS
    cover probability and the moneyline win probability. Its width is a **per-game predicted std** (a small Ridge
    on |residual| ~ elo mismatch / divisional / playoff / weather / rest mismatch, itself walk-forward fit), not

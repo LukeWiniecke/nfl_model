@@ -461,6 +461,55 @@ promising model so far," not "found an edge."
    these hand-picked defaults useful. Both reverted to their original
    values; this is a real, if counterintuitive, lesson worth keeping in
    mind before ever tuning against an accuracy metric here again.
+18. **A 29-experiment autonomous sweep (`program.md`, branch
+    `autoresearch/aug18`) — two changes kept, and a methodology lesson
+    worth more than either.** An LLM ran the loop defined in `program.md`:
+    propose a change, run the full pipeline, score the ensemble's
+    development-era ATS ROI against a fixed harness
+    (`scripts/autoresearch_eval.py`), keep or `git reset --hard`. Kept:
+    **`EWMA_HALFLIFE_GAMES` 6 → 9** and **`MIN_SHRINKAGE_GAMES` 300 → 600**.
+    Together: development ATS ROI **+5.36% → +7.91%** and holdout ATS ROI
+    **+6.24% → +7.51%** — both eras improved, which matters more than the
+    headline number (see below). Still not statistically significant: the
+    development 95% CI is [+0.8%, +15.0%] at n=691.
+
+    **The lesson: the loop's first version reproduced this project's
+    signature failure mode, mechanically and fast.** Its original keep rule
+    was "development ATS ROI improved" — the same rule most of items 1-17
+    were decided under. Run against an EWMA-halflife sweep it kept every
+    step of 6 → 7 → 9 → 12 → 16, because development ROI rose monotonically
+    (+6.06% → +8.53%) the whole way. Holdout ROI fell monotonically over
+    the same steps (+7.36% → +2.04%). Every individual step was "an
+    improvement," every one was inside the ~13pp bootstrap CI, and the
+    end state would have been reported as the best result of the run.
+    Adding a **net-improvement gate** (a change must gain more development
+    ROI than it gives up in holdout ROI) reverted halflife to 9 and killed
+    3 of the 5 originally-kept changes — including an Elo home-field
+    change that had looked like the most credible result of the sweep
+    until it was re-measured on the corrected base, where its entire gain
+    turned out to be an interaction with the overfit halflife.
+
+    **Negative results, recorded so they aren't retried blind** (all
+    development-era ATS ROI, all reverted): Elo K 15 and 26, Elo HFA 40 and
+    48, season regression 0.25, MOV multiplier off, ridge alpha 2.5 and 12,
+    `MIN_TRAIN_SEASONS` 5, dropping `off_rush_epa_ewm_diff`, adding
+    `def_success_rate_allowed_ewm_diff`, adding `off_plays_ewm_diff` (pace)
+    to the margin model, and an `elo_diff × div_game` interaction — that
+    last one produced the sweep's single largest development gain (+0.71pp)
+    while holdout fell 3.89pp, i.e. it is exactly the trap the gate exists
+    to catch. Three incidental findings worth keeping:
+    - **`qb_continuity_diff` is load-bearing**, despite its own note saying
+      it is always 0 for live games. Dropping it: development +6.98% →
+      +4.90%, holdout +7.51% → **-9.77%**.
+    - **LightGBM's exclusion from the ensemble is now measured**, not just
+      parsimony as `config.py` admitted: re-including it cost ~1.2pp of
+      development ATS ROI.
+    - **The adaptive ATS threshold sits on a real local optimum.** Scaling
+      the derived break-even bar by 0.85× gave +5.28% and by 1.25× gave
+      +8.05%, against +9.31% at the derived 1.0×. Nothing in the
+      edge-shrinkage derivation knew where the ROI-maximizing threshold
+      was, and it landed on it — the strongest evidence so far that that
+      machinery is doing something real.
 
 ## Totals (over/under) — phase 1
 
@@ -796,6 +845,41 @@ nfl_model/
 ├── src/                  # pipeline modules
 ├── outputs/{charts,model_results,backtests}/
 ├── app/streamlit_app.py  # dashboard: run with `streamlit run app/streamlit_app.py`
+├── program.md            # autonomous-research spec (see "Autoresearch" below)
+├── scripts/
+│   ├── autoresearch_eval.py  # fixed scoring harness -- do not modify mid-run
+│   ├── plot_progress.py      # experiment progress chart -> progress.png
+│   ├── setup_weekly_refresh.ps1
+│   └── weekly_refresh.ps1
 ├── requirements.txt
 └── main.py               # run this
 ```
+
+## Autoresearch
+
+`program.md` defines an autonomous experiment loop over this model's
+feature engineering, hyperparameters, and bet-selection logic — the
+protocol that produced item 18 above. An agent proposes a change, runs
+`main.py`, scores it with a fixed read-only harness, logs the result, and
+keeps or reverts it. To start a run:
+
+```powershell
+git checkout -b autoresearch/<tag>
+# then point an agent at program.md and have it follow the loop
+```
+
+Scoring is deliberately split from the code under test:
+`scripts/autoresearch_eval.py` reports the ensemble's development- and
+holdout-era ATS/ML ROI (using the existing `config.HOLDOUT_FIRST_SEASON`
+split) into `summary.txt`, and `scripts/plot_progress.py` renders
+`progress.png` from the `results.tsv` experiment log. Both are declared
+read-only during a run so the metric can't drift to meet the result.
+
+The keep/discard gates are the important part, and are the way they are
+because the first version of them failed (see item 18): a change must not
+collapse the bet count, must improve development ROI, **and** must gain
+more development ROI than it gives up in holdout ROI. Statistical
+significance is reported but deliberately not gated on — at n≈700 bets the
+bootstrap CI on ROI is roughly ±13pp, so requiring significance would halt
+the search entirely. Individual keeps are provisional; only a consistent
+direction across many experiments means anything.
