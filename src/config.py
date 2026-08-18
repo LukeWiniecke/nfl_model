@@ -48,6 +48,36 @@ LAST_SEASON = 2026  # current/upcoming season -- bump this each year so its
 # nflverse game_type values to keep. Preseason ("PRE") is always excluded.
 GAME_TYPES_KEPT = ["REG", "WC", "DIV", "CON", "SB"]
 
+# Playoff games are kept as full first-class rows: they are training data,
+# they get predictions, and they get bet. Playoff STATUS is a feature of the
+# uncertainty model only (`is_playoff` in modeling.STD_FEATURES), never of
+# the margin/total point prediction, and Elo treats a playoff game exactly
+# like a regular-season one.
+#
+# Tried and reverted: training the margin/total models on REGULAR-SEASON rows
+# only, while still predicting/grading/betting every game type (implemented
+# as a TRAIN_ON_REGULAR_SEASON_ONLY flag plus modeling._training_rows; see
+# branch autoresearch/reg-only-training). The hypothesis was contamination:
+# playoff games are an unrepresentative 4.3% of rows (188 of 4363) -- no bad
+# teams, bye-week rest gaps that never occur in the regular season,
+# neutral-site Super Bowls -- and the model spends 96% of its life predicting
+# regular-season games.
+#
+# Measured directly, and it is a NULL result rather than a win or a loss:
+#   development ATS ROI  +7.91% -> +7.69%   (aggregate; the decision metric)
+#   holdout ATS ROI      +7.51% -> +8.34%
+#   regular-season ATS   +7.21% -> +7.54%   (the 96% the change targeted)
+#   playoff ATS          +27.8% (n=25) -> +14.1% (n=28)
+# The targeted sub-metric did move the hypothesized way (+0.33pp), and the
+# holdout moved with it (+0.83pp), but the aggregate development number fell
+# because the tiny playoff bet pool swung down -- and every one of those
+# moves is far inside a ~+/-7pp bootstrap CI. The honest reading is that
+# dropping 4.3% of training rows does not measurably change a model fit on
+# 4175 regular-season games, which is roughly what you would expect going in.
+# Not worth the extra config surface for an unmeasurable effect; retry only
+# with a materially different framing (e.g. sample-weighting rather than
+# hard exclusion), not by flipping this back on.
+
 # --- Rolling feature windows -------------------------------------------------
 
 ROLLING_WINDOWS = [8]  # games, per team, recency-weighted rolling stats
