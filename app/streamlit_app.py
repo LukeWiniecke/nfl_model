@@ -220,23 +220,93 @@ def load_game_scores() -> pl.DataFrame:
 
 @st.cache_data
 def load_elo_history() -> pl.DataFrame | None:
-    """One row per team per game, with that team's PRE-game Elo rating."""
+    """One row per team per SCHEDULED game, with that team's PRE-game Elo
+    rating and a `played` flag saying whether that game has a result yet.
+
+    The flag matters. games.parquet keeps not-yet-played games (cleaning
+    stopped dropping them so live_picks can see upcoming fixtures), and
+    power_ratings.compute_elo_ratings records a pre-game rating for every
+    scheduled game while applying the post-game UPDATE only when a result
+    exists. So every remaining game of the current season carries the same
+    number: the team's rating as of its last completed game, repeated.
+
+    That makes those rows useful for one thing and misleading for another. A
+    team's NEXT scheduled game is exactly where its current rating should be
+    read from -- that pre-game rating already includes the last result. But
+    plotting the rest of them draws a flat line months into the future, and
+    labelling the leaderboard off the last of them claims the ratings are
+    current as of a week 18 game in January that has not been played. Callers
+    take the flag and decide; see elo_trajectory and current_elo.
+    """
     ratings_path = config.PROCESSED_DIR / "elo_ratings.parquet"
     games_path = config.PROCESSED_DIR / "games.parquet"
     if not ratings_path.exists() or not games_path.exists():
         return None
     ratings = pl.read_parquet(ratings_path)
-    games = pl.read_parquet(games_path).select(["game_id", "season", "week", "gameday", "home_team", "away_team"])
-    joined = games.join(ratings, on="game_id", how="inner")
+    games = pl.read_parquet(games_path).select(
+        ["game_id", "season", "week", "gameday", "home_team", "away_team", "home_margin"]
+    )
+    joined = games.join(ratings, on="game_id", how="inner").with_columns(
+        pl.col("home_margin").is_not_null().alias("played")
+    )
     home = joined.select(
-        "game_id", "season", "week", "gameday",
+        "game_id", "season", "week", "gameday", "played",
         pl.col("home_team").alias("team"), pl.col("home_elo_pre").alias("elo_pre"),
     )
     away = joined.select(
-        "game_id", "season", "week", "gameday",
+        "game_id", "season", "week", "gameday", "played",
         pl.col("away_team").alias("team"), pl.col("away_elo_pre").alias("elo_pre"),
     )
-    return pl.concat([home, away]).sort(["team", "gameday"])
+    return pl.concat([home, away]).sort(["team", "gameday", "week"])
+
+
+def _next_scheduled(elo_hist: pl.DataFrame) -> pl.DataFrame:
+    """Each team's next unplayed game -- one row per team, or empty."""
+    return (
+        elo_hist.filter(~pl.col("played"))
+        .sort(["team", "gameday", "week"])
+        .unique(subset=["team"], keep="first", maintain_order=True)
+    )
+
+
+def elo_trajectory(elo_hist: pl.DataFrame) -> pl.DataFrame:
+    """Rating history to plot: every completed game, plus each team's next
+    scheduled game so the line ends on the CURRENT rating instead of the one
+    the team carried INTO its most recent game. Without that last point the
+    chart is one result stale; without the filter it runs flat to January.
+    """
+    return pl.concat([elo_hist.filter(pl.col("played")), _next_scheduled(elo_hist)]).sort(
+        ["team", "gameday", "week"]
+    )
+
+
+def current_elo(elo_hist: pl.DataFrame) -> pl.DataFrame:
+    """Each team's current rating, labelled with the completed game it
+    reflects. The value comes from the next scheduled game's pre-game rating
+    (which already includes the last result); the as-of labels come from the
+    last PLAYED game. A team with no game left on the schedule -- the offseason
+    gap before the next season is published -- has no next-game row to read, so
+    it falls back to the rating it carried INTO its last game and is marked
+    reflects_last_result = False rather than being passed off as current.
+    """
+    played = elo_hist.filter(pl.col("played"))
+    as_of = played.group_by("team", maintain_order=False).agg(
+        pl.col("elo_pre").last().alias("_pre_last_played"),
+        pl.col("season").last().alias("as_of_season"),
+        pl.col("week").last().alias("as_of_week"),
+        pl.len().alias("games_rated"),
+    )
+    upcoming = _next_scheduled(elo_hist).select("team", pl.col("elo_pre").alias("_next_pre"))
+    return (
+        as_of.join(upcoming, on="team", how="left")
+        .with_columns(
+            pl.coalesce(["_next_pre", "_pre_last_played"]).alias("elo"),
+            pl.col("_next_pre").is_not_null().alias("reflects_last_result"),
+        )
+        .drop(["_next_pre", "_pre_last_played"])
+        .select("team", "elo", "as_of_season", "as_of_week", "games_rated", "reflects_last_result")
+        .sort("elo", descending=True)
+    )
 
 
 def bucket_axis(df: pl.DataFrame, col: str, order: list[str], labels: dict[str, str]) -> pl.DataFrame:
@@ -1025,7 +1095,8 @@ with tab_ratings:
     if elo_hist is None:
         st.info("No Elo rating history found. Run `python main.py` first.")
     else:
-        teams = sorted(elo_hist["team"].unique().to_list())
+        chart_hist = elo_trajectory(elo_hist)
+        teams = sorted(chart_hist["team"].unique().to_list())
         default_teams = [t for t in ["NE", "NYJ"] if t in teams] or teams[:2]
         selected_teams = st.multiselect(
             "Teams to compare", teams, default=default_teams,
@@ -1037,7 +1108,7 @@ with tab_ratings:
         else:
             fig = go.Figure()
             for i, team in enumerate(selected_teams[:8]):
-                sub = elo_hist.filter(pl.col("team") == team).to_pandas()
+                sub = chart_hist.filter(pl.col("team") == team).to_pandas()
                 fig.add_scatter(
                     x=sub["gameday"], y=sub["elo_pre"], mode="lines", name=team,
                     line=dict(color=palette_cycle[i % len(palette_cycle)], width=2),
@@ -1046,7 +1117,8 @@ with tab_ratings:
                 )
             fig.add_hline(y=config.ELO_INITIAL, line_width=1, line_color=GRID)
             fig.update_layout(
-                title="Elo rating entering each game", yaxis_title="Elo (pre-game)", xaxis_title="Date",
+                title="Elo rating entering each game (line ends on the current rating)",
+                yaxis_title="Elo (pre-game)", xaxis_title="Date",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
                 **CHART_LAYOUT,
             )
@@ -1054,13 +1126,15 @@ with tab_ratings:
             fig.update_yaxes(gridcolor=GRID, linecolor=GRID)
             st.plotly_chart(fig, width="stretch")
 
-        st.subheader("Current ratings (most recent game entering rating, all teams)")
-        latest = (
-            elo_hist.sort(["team", "gameday"])
-            .group_by("team", maintain_order=False)
-            .agg(pl.col("elo_pre").last().alias("elo_pre"), pl.col("season").last().alias("as_of_season"), pl.col("week").last().alias("as_of_week"))
-            .sort("elo_pre", descending=True)
-        )
+        st.subheader("Current ratings (after each team's most recent completed game)")
+        latest = current_elo(elo_hist)
+        as_of = latest.filter(pl.col("reflects_last_result")).select("as_of_season", "as_of_week")
+        if as_of.height:
+            st.caption(
+                f"Includes every result through season {as_of['as_of_season'].max()}, "
+                f"week {as_of['as_of_week'].max()}. A scheduled game that has not been played "
+                "does not move a rating, so this table only advances as results come in."
+            )
         st.dataframe(latest.to_pandas(), width="stretch", hide_index=True)
 
 # --- Bet sizing ----------------------------------------------------------------
