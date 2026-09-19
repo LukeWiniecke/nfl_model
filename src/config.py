@@ -614,6 +614,48 @@ RIDGE_ALPHA_TOTAL = 5.0
 # read the ~1.2pp GAP rather than either absolute figure.)
 ENSEMBLE_INCLUDE_LGBM = False
 
+# Market anchoring of the ensemble's OWN prediction.
+#
+# The measured walk-forward edge-shrinkage slope is ~0.18-0.26 (see the
+# "Edge shrinkage" section below): when the model claims a +5 point edge
+# over the closing line, the realized edge is ~+1 point, i.e. the closing
+# line carries most of the information about the margin and the model's raw
+# output is ~4-5x overconfident relative to it. Until autoresearch r1-E1
+# that correction lived ONLY in the bet-selection layer (shrinkage slope ->
+# adaptive threshold), while the ensemble's predicted_margin, cover
+# probability and win probability were left un-anchored.
+#
+# Allowed values:
+#   None          -- previous behaviour: per-season Ridge meta-regression on
+#                    the base-model predictions only, no market input.
+#   "free"        -- r1-E1: spread_line (total_line for the totals ensemble)
+#                    stacked into that Ridge as one more feature, weights and
+#                    intercept fit freely. Measured: it fixed accuracy (dev
+#                    MAE gap vs market +0.19 -> +0.01, raw ML Brier beat the
+#                    market) but the fitted weights summed to 1.03-1.07 with
+#                    a floating intercept of -0.1..-0.4, which tilted and
+#                    tightened the ATS bet set (692 -> 488 dev bets) and cost
+#                    ROI (+8.0% -> +3.5%).
+#   "constrained" -- r2-E9: predicted = market_line
+#                    + b * (pred_ridge - market_line), with ONE parameter b
+#                    fit through the origin on strictly earlier seasons'
+#                    out-of-fold rows: b = <e, r> / <e, e> with
+#                    e = pred_ridge - line and r = target - line, clipped to
+#                    [SHRINKAGE_SLOPE_FLOOR, SHRINKAGE_SLOPE_CAP]. That is
+#                    the same quantity the edge-shrinkage machinery already
+#                    estimates, applied to the prediction itself. No
+#                    intercept and weights that sum to exactly 1 mean the
+#                    sign and ranking of ats_edge = predicted_margin -
+#                    spread_line are unchanged, so bet selection stays
+#                    essentially today's rule while the margin and the
+#                    probabilities become market-anchored. (If
+#                    ENSEMBLE_INCLUDE_LGBM is on, b becomes a through-origin
+#                    least-squares fit on [e_ridge, e_lgbm].)
+# In every mode ats_edge is still predicted_margin - spread_line; the
+# shrinkage slope and adaptive ATS threshold re-derive themselves on
+# whatever edge scale results.
+ENSEMBLE_MARKET_ANCHOR = "constrained"
+
 LGBM_PARAMS = {
     "objective": "regression",
     "metric": "l2",

@@ -317,6 +317,35 @@ def _walk_forward(
 _STD_CONTEXT_COLS = ["game_id"] + STD_RAW_CONTEXT_COLS
 
 
+# --- config.ENSEMBLE_MARKET_ANCHOR == "constrained" helpers ------------------
+# predicted = line + E @ b, where E holds one column per base model of
+# (base prediction - line) and b is fit through the origin on
+# (target - line). Frame-agnostic (polars in walk-forward, pandas live).
+
+def _anchor_arrays(df, base_cols: list[str], market_col: str) -> tuple[np.ndarray, np.ndarray]:
+    m = np.asarray(df[market_col], dtype=float)
+    E = np.column_stack([np.asarray(df[c], dtype=float) - m for c in base_cols])
+    return m, E
+
+
+def _fit_anchor_slope(E: np.ndarray, r: np.ndarray) -> np.ndarray:
+    """One base model: closed form b = <e,r>/<e,e> -- the same statistic
+    probabilities.fit_edge_shrinkage_walk_forward computes for the betting
+    layer -- clipped to the same guard rails. Two base models: through-origin
+    least squares on [e_ridge, e_lgbm] (not exercised while
+    ENSEMBLE_INCLUDE_LGBM is False)."""
+    if E.shape[1] == 1:
+        e = E[:, 0]
+        denom = float(np.dot(e, e))
+        b = float(np.dot(e, r) / denom) if denom > 0 else 0.0
+        return np.array([np.clip(b, config.SHRINKAGE_SLOPE_FLOOR, config.SHRINKAGE_SLOPE_CAP)])
+    return np.linalg.lstsq(E, r, rcond=None)[0]
+
+
+def _anchor_log(base_cols: list[str], b: np.ndarray, market_col: str) -> str:
+    return " ".join(f"b({c.replace('pred_', '')})={v:.3f}" for c, v in zip(base_cols, b)) + f" anchor={market_col}"
+
+
 def walk_forward_ensemble(
     modeling_table: pl.DataFrame, ridge_result: WalkForwardResult, lgbm_result: WalkForwardResult,
     target_col: str = "home_margin", pred_col: str = "predicted_margin", model_name: str = "ensemble",
@@ -336,12 +365,20 @@ def walk_forward_ensemble(
         lgbm_df = lgbm_result.predictions.select(["game_id", pred_col]).rename({pred_col: "pred_lgbm"})
         merged = merged.join(lgbm_df, on="game_id", how="inner")
     merged = merged.join(modeling_table.select(_STD_CONTEXT_COLS), on="game_id", how="left")
+    # Market line for this target (see config.ENSEMBLE_MARKET_ANCHOR). Joined
+    # regardless of the mode; rows with no posted line can't be scored against
+    # it, so they are dropped here rather than left for _prep_xy (no imputation).
+    market_col = "spread_line" if target_col == "home_margin" else "total_line"
+    merged = merged.join(modeling_table.select(["game_id", market_col]), on="game_id", how="left")
+    merged = merged.filter(pl.col(market_col).is_not_null())
 
     seasons = sorted(merged["season"].unique().to_list())
     test_seasons = [s for s in seasons if s >= FIRST_PREDICTABLE_SEASON + 1]
 
     all_preds = []
-    meta_cols = [c for c in ["pred_ridge", "pred_lgbm"] if c in merged.columns]
+    anchor = config.ENSEMBLE_MARKET_ANCHOR
+    base_cols = [c for c in ["pred_ridge", "pred_lgbm"] if c in merged.columns]
+    meta_cols = base_cols + ([market_col] if anchor == "free" else [])
 
     # Same out-of-fold std pool as _walk_forward -- see its comment. The meta
     # model is only a 2-feature ridge and barely overfits, so this matters
@@ -357,11 +394,22 @@ def walk_forward_ensemble(
             continue
 
         X_train, y_train = _prep_xy(train_df, meta_cols, target_col)
-        meta = Ridge(alpha=1.0)
-        meta.fit(X_train, y_train)
-
         X_test, y_test = _prep_xy(test_df, meta_cols, target_col)
-        pred = meta.predict(X_test)
+        if anchor == "constrained":
+            # b on strictly earlier seasons' out-of-fold rows only (train_df).
+            m_train, E_train = _anchor_arrays(train_df, base_cols, market_col)
+            b = _fit_anchor_slope(E_train, y_train.to_numpy() - m_train)
+            train_pred = m_train + E_train @ b
+            m_test, E_test = _anchor_arrays(test_df, base_cols, market_col)
+            pred = m_test + E_test @ b
+            fit_log = _anchor_log(base_cols, b, market_col)
+        else:
+            meta = Ridge(alpha=1.0)
+            meta.fit(X_train, y_train)
+            train_pred = meta.predict(X_train)
+            pred = meta.predict(X_test)
+            weights = " ".join(f"weight({c.replace('pred_', '')})={w:.2f}" for c, w in zip(meta_cols, meta.coef_))
+            fit_log = f"{weights} intercept={meta.intercept_:.2f}"
 
         n_oof = sum(len(r) for r in oof_resid)
         if n_oof >= config.MIN_OOF_STD_GAMES:
@@ -369,7 +417,7 @@ def walk_forward_ensemble(
             std_fit_resid = np.concatenate(oof_resid)
         else:
             std_fit_df = train_df
-            std_fit_resid = y_train.to_numpy() - meta.predict(X_train)
+            std_fit_resid = y_train.to_numpy() - train_pred
 
         out = test_df.select(["game_id", "season", "week", "home_team", "away_team", target_col]).to_pandas()
         out[pred_col] = pred
@@ -380,8 +428,7 @@ def walk_forward_ensemble(
         oof_ctx.append(test_df.select(_std_context_columns(test_df)))
         oof_resid.append(y_test.to_numpy() - pred)
 
-        weights = " ".join(f"weight({c.replace('pred_', '')})={w:.2f}" for c, w in zip(meta_cols, meta.coef_))
-        logger.info(f"[{model_name}] {test_season}: {weights} intercept={meta.intercept_:.2f}")
+        logger.info(f"[{model_name}] {test_season}: {fit_log}")
 
     predictions = pl.from_pandas(pd.concat(all_preds, ignore_index=True))
     margin_std = float(np.std(np.concatenate(oof_resid), ddof=1))
@@ -530,25 +577,54 @@ def predict_upcoming_ensemble(
         hist = hist.join(hist_lgbm, on="game_id", how="inner")
         live = live.merge(lgbm_live[["game_id", pred_col]].rename(columns={pred_col: "pred_lgbm"}), on="game_id")
         meta_cols.append("pred_lgbm")
+    # Same market column as walk_forward_ensemble (config.ENSEMBLE_MARKET_ANCHOR).
+    # `live` already carries spread_line/total_line via LIVE_MARKET_COLS.
+    market_col = "spread_line" if target_col == "home_margin" else "total_line"
+    hist = hist.join(modeling_table.select(["game_id", market_col]), on="game_id", how="left")
+    hist = hist.filter(pl.col(market_col).is_not_null())
+    anchor = config.ENSEMBLE_MARKET_ANCHOR
+    base_cols = list(meta_cols)
+    if anchor is not None:
+        # A live row with no posted line can't be anchored to it: drop it
+        # rather than feed NaN into the prediction. No-op on current data
+        # (_predict_upcoming already requires spread_line on upcoming rows).
+        live = live[live[market_col].notna()].reset_index(drop=True)
+        if live.empty:
+            return None
+    if anchor == "free":
+        meta_cols.append(market_col)
 
     X_train, y_train = _prep_xy(hist, meta_cols, target_col)
-    meta = Ridge(alpha=1.0)
-    meta.fit(X_train, y_train)
-
-    live[pred_col] = meta.predict(live[meta_cols])
-    live = live.drop(columns=meta_cols + ["predicted_std"])
+    if anchor == "constrained":
+        # b on ALL historical out-of-fold rows (no season held out), same
+        # formula as the walk-forward path.
+        m_hist, E_hist = _anchor_arrays(hist, base_cols, market_col)
+        b = _fit_anchor_slope(E_hist, y_train.to_numpy() - m_hist)
+        train_pred = m_hist + E_hist @ b
+        m_live, E_live = _anchor_arrays(live, base_cols, market_col)
+        live[pred_col] = m_live + E_live @ b
+        fit_log = _anchor_log(base_cols, b, market_col)
+    else:
+        meta = Ridge(alpha=1.0)
+        meta.fit(X_train, y_train)
+        train_pred = meta.predict(X_train)
+        live[pred_col] = meta.predict(live[meta_cols])
+        weights = " ".join(f"weight({c.replace('pred_', '')})={w:.2f}" for c, w in zip(meta_cols, meta.coef_))
+        fit_log = f"{weights} intercept={meta.intercept_:.2f}"
+    # Drop only the base-model prediction columns -- never the market column;
+    # the upcoming board needs spread_line/total_line downstream.
+    live = live.drop(columns=base_cols + ["predicted_std"])
 
     # The ensemble's inputs here are already out-of-fold (both base models'
     # walk-forward predictions), so the meta model's residuals against them
     # are an honest out-of-sample spread -- unlike a base model's own
     # in-sample residuals. See _fit_predict_conditional_std.
-    resid = y_train.to_numpy() - meta.predict(X_train)
+    resid = y_train.to_numpy() - train_pred
     hist_ctx = hist.join(modeling_table.select(_STD_CONTEXT_COLS), on="game_id", how="left")
     live_ctx = pl.from_pandas(live[["game_id"]]).join(modeling_table.select(_STD_CONTEXT_COLS), on="game_id", how="left")
     live["predicted_std"] = _fit_predict_conditional_std(hist_ctx, live_ctx, resid)
 
-    weights = " ".join(f"weight({c.replace('pred_', '')})={w:.2f}" for c, w in zip(meta_cols, meta.coef_))
-    logger.info(f"[ensemble live] {weights} intercept={meta.intercept_:.2f}")
+    logger.info(f"[ensemble live] {fit_log}")
     return live
 
 
