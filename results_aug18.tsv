@@ -1,0 +1,31 @@
+commit	dev_ats_roi	dev_ats_n	holdout_ats_roi	status	description	notes
+cce511f	0.0536	779	0.0624	keep	baseline (unmodified config)	dev_ml_roi 0.1433 CI[-.015,+.122]
+07991c3	0.0606	784	0.0736	keep	EWMA_HALFLIFE_GAMES 6->7	dev_ml_roi 0.1196
+a4bc616	0.0698	781	0.0751	keep	EWMA_HALFLIFE_GAMES 7->9	dev_ml_roi 0.1235 CI excl 0 [+.003,+.136]
+ce5962b	0.0831	785	0.0411	discard	EWMA_HALFLIFE_GAMES 9->12	RETROACTIVE Gate C fail: holdout -3.40pp while dev rose
+f86dd76	0.0853	794	0.0204	discard	EWMA_HALFLIFE_GAMES 12->16	RETROACTIVE Gate C fail: holdout -2.07pp; +0.22pp dev = noise
+c6560eb	0.0931	800	0.0431	discard	ELO_HOME_FIELD_ADVANTAGE 55->48	RETROACTIVE: base-dependent, fails when re-measured on EWMA=9
+ec291fe	0.0862	808	0.0411	discard	ELO_HOME_FIELD_ADVANTAGE 48->40	optimum near 48; overshoot
+e009e0f	0.0786	835	0.0433	discard	RIDGE_ALPHA_MARGIN 5->12	confirms README: higher alpha hurts ROI even selecting on ROI
+cbbe85d	0.0769	758	0.0686	discard	RIDGE_ALPHA_MARGIN 5->2.5	alpha=5 is local optimum both directions
+6c264a4	0.0648	765	0.0366	discard	drop off_rush_epa_ewm_diff	rush EPA carries real signal; not redundant
+d770de2	0.0613	796	0.0684	discard	SEASON_REGRESSION_TO_MEAN 0.33->0.25	0.33 well-calibrated; carrying more forward hurts
+99317bf	0.0654	774	0.0577	discard	ELO_K 20->26	K=20 holds
+f01d6fa	0.0718	811	0.0309	discard	ELO_K 20->15	K=20 local optimum both directions
+4f59e1f	0.0813	726	0.0694	discard	ENSEMBLE_INCLUDE_LGBM False->True	confirms lgbm exclusion is right on ROI not just parsimony
+f40347c	0.0805	647	-0.0687	discard	ATS threshold 1.25x safety margin	more selective hurts; holdout went negative
+3f5cfc6	0.0528	926	0.0343	discard	ATS threshold 0.85x break-even	break-even bar optimal at exactly 1.0x both directions
+27c0ae4	0.0695	783	0.0830	discard	HFA 55->48 re-measured on EWMA=9 base	FAILS Gate B: dev 6.98->6.95; earlier gain was EWMA=16 interaction
+c673096	0.0698	781	0.0751	keep	VERIFIED BASELINE EWMA=9 HFA=55 (post Gate C re-audit)	dev +1.62pp AND holdout +1.27pp vs orig baseline; reproduces a4bc616 exactly
+dd92fb4	0.0692	787	0.0638	discard	add def_success_rate_allowed_ewm_diff	Gate B: 6.98->6.92; def success rate redundant with def EPA
+b909cc6	0.0655	743	0.0500	discard	ELO_MOV_MULTIPLIER True->False	MOV scaling earns its place
+956ba2e	0.0723	332	0.0146	discard	MIN_TRAIN_SEASONS 3->5	Gate A: n_bets 781->332 (-57%); ROI flattered by smaller sample
+5b50005	0.0613	738	0.0499	discard	add off_plays_ewm_diff (pace) to margin	confirms config.py theory-based exclusion with data
+46b1fee	0.0490	535	-0.0977	discard	drop qb_continuity_diff	big loss; matters more than 'always 0 live' note implies
+b1b08e4	0.0722	783	0.0560	discard	EWMA_HALFLIFE_GAMES 9->10	REVERTED in audit: +0.24pp dev vs -1.91pp holdout = net negative
+fc8d983	0.0793	776	0.0171	discard	add elo_diff x div_game interaction	Gate C: dev +0.71pp but holdout -3.89pp; old rule would have kept it
+7f725dd	0.0802	694	0.0560	discard	MIN_SHRINKAGE_GAMES 300->600 (on EWMA=10 base)	change RETAINED but this config state abandoned; re-measured on EWMA=9
+45158ef	0.0736	612	0.0560	discard	MIN_SHRINKAGE_GAMES 600->900	600 is the sweet spot
+a1b9d87	0.0802	694	0.0560	discard	SHRINKAGE_SLOPE_FLOOR 0.02->0.08	NO-OP: byte-identical; floor never binds
+572112c	0.0791	691	0.0751	keep	FINAL ADOPTED: EWMA=9 + MIN_SHRINKAGE_GAMES=600	beats baseline on BOTH eras: dev +2.55pp, holdout +1.27pp
+8b9817a	0.0769	709	0.0834	discard	train on REG only (exclude playoffs from training)	NULL: Gate B 7.91->7.69; REG-only ROI +0.33pp and holdout +0.83pp but all inside noise
