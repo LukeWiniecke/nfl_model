@@ -1,11 +1,25 @@
 Model:                  ensemble
-Dev ATS ROI:            +0.0791
-Dev ATS n_bets:         691
-Dev ATS 95% CI:         [+0.0082, +0.1502]
-Holdout ATS ROI:        +0.0751
-Holdout ATS n_bets:     94
-Dev ML ROI:             +0.1235
-Dev ML n_bets:          492
-Dev ML 95% CI:          [+0.0001, +0.2473]
-Holdout ML ROI:         +0.0389
-Holdout ML n_bets:      149
+Dev ATS ROI:            +0.0803
+Dev ATS n_bets:         692
+Dev ATS 95% CI:         [+0.0107, +0.1523]
+Holdout ATS ROI:        +0.0527
+Holdout ATS n_bets:     96
+Dev ML ROI:             +0.1213
+Dev ML n_bets:          493
+Dev ML 95% CI:          [+0.0016, +0.2460]
+Holdout ML ROI:         +0.0208
+Holdout ML n_bets:      154
+Dev MAE model/market:   10.1681 / 9.9762  gap +0.1918
+Dev RMSE model/market:  13.0908 / 12.9185  gap +0.1723
+Dev Brier ML model/market: 0.2181 / 0.2123  gap +0.0058  (raw 0.2168)
+Dev Brier ATS model:    0.2536  (raw 0.2539)
+Dev ECE ATS / ML:       0.0339 / 0.0321
+Dev calib slope ATS/ML: 0.003 / 0.775
+Dev shrink slope / thr: 0.258 / 3.50
+Holdout MAE model/market:   10.0366 / 9.8073  gap +0.2292
+Holdout RMSE model/market:  12.9902 / 12.7266  gap +0.2636
+Holdout Brier ML model/market: 0.2149 / 0.2101  gap +0.0047  (raw 0.2175)
+Holdout Brier ATS model:    0.2518  (raw 0.2562)
+Holdout ECE ATS / ML:       0.0442 / 0.0276
+Holdout calib slope ATS/ML: 0.315 / 0.959
+Holdout shrink slope / thr: 0.228 / 4.50
