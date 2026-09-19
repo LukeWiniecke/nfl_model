@@ -700,6 +700,31 @@ MIN_OOF_STD_GAMES = 200
 # data yet to trust a calibration curve.
 MIN_CALIBRATION_GAMES = 150
 
+# Which recalibration curve walk_forward_calibrate (and live_picks.
+# _calibrate_live, which must match it so the live board is the thing the
+# backtest validated) fits on those prior seasons' (raw prob, outcome) pairs:
+#   'platt'    -- logistic regression of outcome on logit(raw prob): two
+#                 parameters (slope + intercept), so it can only stretch or
+#                 compress the raw probability, never invent structure.
+#   'isotonic' -- the PREVIOUS value: monotone step function fit by
+#                 sklearn IsotonicRegression. Measured on the ensemble
+#                 baseline it was overfitting ~2,000 (prob, outcome) pairs
+#                 into noise: the isotonic-calibrated ML Brier (0.2181) was
+#                 WORSE than the raw Brier (0.2168), and the calibrated
+#                 cover probability had a calibration slope of 0.003, i.e.
+#                 the recalibrated number carried no relationship to the
+#                 outcome at all. Platt's two parameters cannot manufacture
+#                 that kind of spurious structure.
+CALIBRATION_METHOD = "platt"
+# Platt fit details. Raw probabilities are clipped this far away from 0/1
+# before the logit so a saturated CDF can never produce +/-inf; C is huge so
+# the fit is effectively unregularized (two parameters on 150+ points need
+# no shrinkage, and L2 would pull the slope toward 0, itself a calibration
+# bias); max_iter is generous so lbfgs always converges.
+PLATT_PROB_CLIP = 1e-4
+PLATT_C = 1e6
+PLATT_MAX_ITER = 2000
+
 # Walk-forward Student's-t degrees-of-freedom fit (see
 # probabilities.fit_t_dof_walk_forward), an alternative to the Normal CDF
 # for converting a predicted margin/total into a probability -- tests

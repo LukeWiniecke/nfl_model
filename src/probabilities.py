@@ -5,6 +5,7 @@ market odds into de-vigged implied probabilities for comparison.
 import numpy as np
 from scipy.stats import norm, t as student_t
 from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 
 from . import config
 from .utils import american_payout_multiplier, american_to_prob, prob_to_american, remove_vig_two_way
@@ -244,15 +245,53 @@ def moneyline_edge(model_home_prob: np.ndarray, home_moneyline: np.ndarray, away
     return np.asarray(model_home_prob) - market_home_prob
 
 
+def _logit_feature(prob: np.ndarray) -> np.ndarray:
+    """logit(raw prob) as a single-column design matrix for Platt scaling,
+    clipped away from 0/1 first (config.PLATT_PROB_CLIP) so a saturated CDF
+    can never hand the logistic fit an infinite input."""
+    p = np.clip(np.asarray(prob, dtype=float), config.PLATT_PROB_CLIP, 1.0 - config.PLATT_PROB_CLIP)
+    return np.log(p / (1.0 - p)).reshape(-1, 1)
+
+
+def fit_calibrator(train_prob: np.ndarray, train_outcome: np.ndarray):
+    """Fit ONE recalibration curve on (raw prob, outcome) training pairs and
+    return it as a callable raw_prob -> calibrated_prob. The curve family is
+    chosen by config.CALIBRATION_METHOD (see the note there for why):
+
+      'platt'    -- logistic regression of outcome on logit(raw prob), two
+                    parameters (slope + intercept): can stretch/compress a
+                    raw probability but cannot invent structure.
+      'isotonic' -- the previous method: sklearn IsotonicRegression, a
+                    monotone step function.
+
+    Shared by walk_forward_calibrate (backtest) and live_picks._calibrate_live
+    (upcoming board) so the two can never disagree on the curve family.
+    """
+    train_prob = np.asarray(train_prob, dtype=float)
+    train_outcome = np.asarray(train_outcome, dtype=float)
+    method = config.CALIBRATION_METHOD
+    if method == "platt":
+        lr = LogisticRegression(C=config.PLATT_C, max_iter=config.PLATT_MAX_ITER)
+        lr.fit(_logit_feature(train_prob), train_outcome)
+        return lambda p: lr.predict_proba(_logit_feature(p))[:, 1]
+    if method == "isotonic":
+        iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        iso.fit(train_prob, train_outcome)
+        return lambda p: iso.predict(np.asarray(p, dtype=float))
+    raise ValueError(f"unknown config.CALIBRATION_METHOD {method!r}; expected 'platt' or 'isotonic'")
+
+
 def walk_forward_calibrate(df, prob_col: str, outcome: np.ndarray) -> np.ndarray:
     """Recalibrate a raw predicted probability season-by-season: for each
-    season, fit an isotonic regression mapping raw probability -> empirical
-    outcome rate using only STRICTLY EARLIER seasons' (prediction, outcome)
-    pairs, then apply it to this season's predictions. Same walk-forward
-    discipline as the margin models themselves -- a season's own outcomes
-    never influence its own calibration. Seasons with fewer than
-    config.MIN_CALIBRATION_GAMES prior graded games (i.e. the first
-    predictable season) are passed through raw, unchanged.
+    season, fit a calibration curve (config.CALIBRATION_METHOD -- Platt
+    logistic scaling by default, isotonic previously; see fit_calibrator)
+    mapping raw probability -> empirical outcome rate using only STRICTLY
+    EARLIER seasons' (prediction, outcome) pairs, then apply it to this
+    season's predictions. Same walk-forward discipline as the margin models
+    themselves -- a season's own outcomes never influence its own
+    calibration. Seasons with fewer than config.MIN_CALIBRATION_GAMES prior
+    graded games (i.e. the first predictable season) are passed through raw,
+    unchanged.
 
     `df` must have a `season` column aligned with `prob_col` and `outcome`.
     """
@@ -266,9 +305,8 @@ def walk_forward_calibrate(df, prob_col: str, outcome: np.ndarray) -> np.ndarray
         test_mask = season == s
         if train_mask.sum() < config.MIN_CALIBRATION_GAMES:
             continue
-        iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-        iso.fit(prob[train_mask], outcome[train_mask])
-        out[test_mask] = iso.predict(prob[test_mask])
+        calibrate = fit_calibrator(prob[train_mask], outcome[train_mask])
+        out[test_mask] = calibrate(prob[test_mask])
 
     return out
 

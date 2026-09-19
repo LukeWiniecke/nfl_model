@@ -19,7 +19,6 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import polars as pl
-from sklearn.isotonic import IsotonicRegression
 
 from scipy.stats import norm
 
@@ -27,6 +26,7 @@ from . import config
 from .probabilities import (
     ats_cover_probability_t,
     breakeven_probability,
+    fit_calibrator,
     fit_dof_all_history,
     fit_edge_shrinkage_all_history,
     home_win_probability_t,
@@ -73,18 +73,19 @@ def _live_ats_threshold(
 
 
 def _calibrate_live(hist_bets: pl.DataFrame, raw_col: str, outcome_expr: pl.Expr, live_raw: np.ndarray) -> np.ndarray:
-    """Fit one isotonic calibrator on ALL historical (raw prob, outcome)
-    pairs -- no season-by-season split needed, since there's only one
-    "current" bucket of upcoming games to apply it to -- and use it on the
-    live raw probabilities. Falls back to the raw probability, unchanged, if
-    there isn't enough historical data yet (config.MIN_CALIBRATION_GAMES)."""
+    """Fit one calibrator (probabilities.fit_calibrator, so the curve family
+    follows config.CALIBRATION_METHOD exactly as the backtest's
+    walk_forward_calibrate does) on ALL historical (raw prob, outcome) pairs
+    -- no season-by-season split needed, since there's only one "current"
+    bucket of upcoming games to apply it to -- and use it on the live raw
+    probabilities. Falls back to the raw probability, unchanged, if there
+    isn't enough historical data yet (config.MIN_CALIBRATION_GAMES)."""
     hist = hist_bets.filter(pl.col(raw_col).is_not_null()).with_columns(outcome_expr.alias("_outcome"))
     hist = hist.filter(pl.col("_outcome").is_not_null()).to_pandas()
     if len(hist) < config.MIN_CALIBRATION_GAMES:
         return live_raw
-    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-    iso.fit(hist[raw_col].to_numpy(dtype=float), hist["_outcome"].to_numpy(dtype=float))
-    return iso.predict(live_raw)
+    calibrate = fit_calibrator(hist[raw_col].to_numpy(dtype=float), hist["_outcome"].to_numpy(dtype=float))
+    return calibrate(np.asarray(live_raw, dtype=float))
 
 
 def build_upcoming_board(
