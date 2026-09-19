@@ -832,6 +832,37 @@ MIN_SHRINKAGE_GAMES = 600
 SHRINKAGE_SLOPE_FLOOR = 0.02
 SHRINKAGE_SLOPE_CAP = 1.0
 
+# Select ATS bets on the UNANCHORED ridge edge, while still REPORTING the
+# market-anchored margin (see ENSEMBLE_MARKET_ANCHOR) everywhere.
+#
+# The principle: anchoring is a monotone rescaling of the selection signal,
+# so it cannot add or remove real information about WHICH games to bet.
+# Measured on r2-E9, exactly and not approximately: ats_edge = b_S * e_raw in
+# every season (max deviation 0.0), so the SIGN and the RANKING of edges are
+# perfectly preserved. The bet decomposition confirms it from the other side:
+# on the 445 development bets the anchored and unanchored versions BOTH
+# place, ROI is IDENTICAL (+0.0675 vs +0.0675; holdout +0.0703 either way on
+# 73 common bets). Grading never moved -- only the bet universe did.
+#
+# What moved the universe was a scale mismatch. The betting layer's constants
+# (ATS_EDGE_THRESHOLD_POINTS, and the SHRINKAGE_SLOPE_CAP above) are
+# expressed on the RAW, unshrunk edge scale. Under anchoring the edge is 4-9x
+# smaller, so (a) seasons below MIN_SHRINKAGE_GAMES fell back to a 3.5-point
+# bar worth a raw-equivalent 32.5 / 15.9 / 10.7 points in 2014/2015/2016 and
+# placed 0 / 0 / 1 bets instead of ~52 / 50 / 49, and (b) for 2017-2019 the
+# betting layer's own shrinkage slope -- fit on PRIOR seasons, which were
+# anchored with a SMALLER b_S than the current one -- came out at 1.982 and
+# hit SHRINKAGE_SLOPE_CAP, which the comment above calls "measured INERT" and
+# which is not inert once anchoring is on. Applying the anchor's shrinkage
+# and then the betting layer's own estimate of that same quantity is
+# double-shrinkage.
+#
+# So: report the anchored margin (that is what fixed MAE/RMSE/Brier against
+# the closing line) but hand the selection machinery the unanchored edge it
+# was validated on. True decouples the two; False restores r2-E9's behaviour
+# of selecting on whatever scale the report happens to be on.
+ATS_SELECT_ON_UNANCHORED = True
+
 # Moneyline: restrict to underdog-side bets only.
 #
 # Measured directly against a blind "bet the underdog in these same games"

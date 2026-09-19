@@ -402,12 +402,23 @@ def walk_forward_ensemble(
             train_pred = m_train + E_train @ b
             m_test, E_test = _anchor_arrays(test_df, base_cols, market_col)
             pred = m_test + E_test @ b
+            # Pre-anchor prediction, i.e. b = 1: the base models' own output,
+            # which for a single base model is pred_ridge exactly. Reported
+            # alongside `pred` so the betting layer can SELECT on the
+            # unanchored scale its thresholds were validated on while
+            # everything still REPORTS the anchored margin -- see
+            # config.ATS_SELECT_ON_UNANCHORED.
+            pred_unanchored = m_test + E_test.mean(axis=1)
             fit_log = _anchor_log(base_cols, b, market_col)
         else:
             meta = Ridge(alpha=1.0)
             meta.fit(X_train, y_train)
             train_pred = meta.predict(X_train)
             pred = meta.predict(X_test)
+            # No anchoring applied, so there is nothing to undo: the
+            # unanchored column is the prediction itself and every consumer
+            # of it collapses to today's behaviour.
+            pred_unanchored = pred
             weights = " ".join(f"weight({c.replace('pred_', '')})={w:.2f}" for c, w in zip(meta_cols, meta.coef_))
             fit_log = f"{weights} intercept={meta.intercept_:.2f}"
 
@@ -421,6 +432,7 @@ def walk_forward_ensemble(
 
         out = test_df.select(["game_id", "season", "week", "home_team", "away_team", target_col]).to_pandas()
         out[pred_col] = pred
+        out[f"{pred_col}_unanchored"] = pred_unanchored
         out["predicted_std"] = _fit_predict_conditional_std(std_fit_df, test_df, std_fit_resid)
         out["model"] = model_name
         all_preds.append(out)
@@ -603,12 +615,17 @@ def predict_upcoming_ensemble(
         train_pred = m_hist + E_hist @ b
         m_live, E_live = _anchor_arrays(live, base_cols, market_col)
         live[pred_col] = m_live + E_live @ b
+        # Pre-anchor prediction -- see walk_forward_ensemble. Set BEFORE the
+        # base-model columns are dropped below, since for one base model it
+        # is pred_ridge itself.
+        live[f"{pred_col}_unanchored"] = m_live + E_live.mean(axis=1)
         fit_log = _anchor_log(base_cols, b, market_col)
     else:
         meta = Ridge(alpha=1.0)
         meta.fit(X_train, y_train)
         train_pred = meta.predict(X_train)
         live[pred_col] = meta.predict(live[meta_cols])
+        live[f"{pred_col}_unanchored"] = live[pred_col]
         weights = " ".join(f"weight({c.replace('pred_', '')})={w:.2f}" for c, w in zip(meta_cols, meta.coef_))
         fit_log = f"{weights} intercept={meta.intercept_:.2f}"
     # Drop only the base-model prediction columns -- never the market column;

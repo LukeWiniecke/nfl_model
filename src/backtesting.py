@@ -40,7 +40,7 @@ def _bet_side(edge: np.ndarray, threshold) -> np.ndarray:
     return np.where(edge > threshold, "home", np.where(edge < -threshold, "away", "none"))
 
 
-def decide_bet_side(df: pd.DataFrame, market: str, threshold) -> np.ndarray:
+def decide_bet_side(df: pd.DataFrame, market: str, threshold, edge_col: str | None = None) -> np.ndarray:
     """The single source of truth for "which side, if any, do we bet".
 
     Exists because the selection rule is applied in four places (the ATS
@@ -48,8 +48,16 @@ def decide_bet_side(df: pd.DataFrame, market: str, threshold) -> np.ndarray:
     recompute it at the sidebar's threshold), and the moneyline underdog-only
     restriction was silently missing from the dashboard copies -- so the app
     would show favorite ML picks the backtest would never have placed.
+
+    `edge_col` names the column to SELECT on, and defaults to the market's
+    reported edge, which is what every existing caller (the dashboard
+    included) wants. build_ats_bets passes `ats_edge_select` instead so the
+    reported edge can be market-anchored while selection stays on the
+    unanchored scale the thresholds were validated on -- see
+    config.ATS_SELECT_ON_UNANCHORED.
     """
-    edge_col = "ats_edge" if market == "ats" else "ml_edge"
+    if edge_col is None:
+        edge_col = "ats_edge" if market == "ats" else "ml_edge"
     side = _bet_side(df[edge_col].to_numpy(), threshold)
     if market == "ml" and config.ML_UNDERDOG_ONLY:
         favorite_side = np.where(df["spread_line"].to_numpy() > 0, "home", "away")
@@ -57,7 +65,7 @@ def decide_bet_side(df: pd.DataFrame, market: str, threshold) -> np.ndarray:
     return side
 
 
-def adaptive_ats_threshold(df: pd.DataFrame) -> np.ndarray:
+def adaptive_ats_threshold(df: pd.DataFrame, edge_col: str = "ats_edge") -> np.ndarray:
     """Per-game minimum RAW edge required to place an ATS bet, derived rather
     than hardcoded. Three steps, all walk-forward:
 
@@ -78,8 +86,15 @@ def adaptive_ats_threshold(df: pd.DataFrame) -> np.ndarray:
     exactly what it always did, so the dashboard's slider, the edge-bucket
     breakdowns, and optimal_threshold_walk_forward all keep working unchanged
     and stay comparable to previously saved runs.
+
+    Everything here -- the fitted slope, and the fixed fallback it reverts to
+    when there is too little history -- is expressed on the scale of
+    `edge_col`. That is why the caller must pass the SAME column it will then
+    select on: ATS_EDGE_THRESHOLD_POINTS is a raw-scale constant, so deriving
+    the bar from a market-anchored edge and then applying it to that same
+    (4-9x smaller) edge silently turns the fallback into a 10-30 point bar.
     """
-    slope, sd = fit_edge_shrinkage_walk_forward(df, "ats_edge", "_ats_resid")
+    slope, sd = fit_edge_shrinkage_walk_forward(df, edge_col, "_ats_resid")
 
     # Use the worse (more expensive) of the two sides' prices, so a game is
     # only bet if it clears the bar at the price actually available.
@@ -97,16 +112,23 @@ def _totals_side(edge: np.ndarray, threshold: float) -> np.ndarray:
     return np.where(edge > threshold, "over", np.where(edge < -threshold, "under", "none"))
 
 
-def regrade_ats(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+def regrade_ats(df: pd.DataFrame, threshold: float, edge_col: str = "ats_edge") -> pd.DataFrame:
     """Given a table that already has `ats_edge`, `home_margin`, `spread_line`,
     and spread odds columns, (re)decide bet_side at `threshold` and grade it.
     Split out from build_ats_bets so the dashboard can re-run this at a
-    user-chosen threshold without recomputing predictions/edge from scratch."""
+    user-chosen threshold without recomputing predictions/edge from scratch.
+
+    `edge_col` defaults to the reported `ats_edge`, so the dashboard's regrade
+    path and optimal_threshold_walk_forward are unchanged; build_ats_bets
+    passes the selection edge (see config.ATS_SELECT_ON_UNANCHORED). Only the
+    SIDE decision uses it -- grading is against the realized margin either
+    way, which is why moving the selection scale can change which games are
+    bet but never how a bet resolves."""
     # reset_index: bet_won below gets a fresh default RangeIndex, which silently
     # misaligns (and raises) against df's own index unless it's already 0..n-1 --
     # true for a full to_pandas() conversion but not for an arbitrary filtered slice.
     df = df.reset_index(drop=True)
-    df["bet_side"] = decide_bet_side(df, "ats", threshold)
+    df["bet_side"] = decide_bet_side(df, "ats", threshold, edge_col=edge_col)
 
     is_push = np.isclose(df["home_margin"], df["spread_line"])
     home_covers = df["home_margin"] > df["spread_line"]
@@ -223,9 +245,29 @@ def build_ats_bets(preds_with_market: pl.DataFrame, margin_std: float) -> pl.Dat
     # it is the number actually worth looking at on a pick.
     df["ats_edge_shrunk"] = df["ats_edge"] * slope
 
+    # The edge bets are SELECTED on, which is not necessarily the edge that
+    # is reported. Under market anchoring the reported edge is b_S * e_raw --
+    # a monotone rescaling, so it ranks games identically, but it lives on a
+    # scale the betting layer's raw-scale constants do not understand. See
+    # config.ATS_SELECT_ON_UNANCHORED. With the flag off, or for a model that
+    # emits no unanchored column (ridge/lgbm never anchor), this is ats_edge
+    # and every line below collapses to the previous behaviour.
+    select_unanchored = config.ATS_SELECT_ON_UNANCHORED and "predicted_margin_unanchored" in df.columns
+    if select_unanchored:
+        df["ats_edge_select"] = df["predicted_margin_unanchored"] - df["spread_line"]
+    else:
+        df["ats_edge_select"] = df["ats_edge"]
+
     if config.USE_ADAPTIVE_THRESHOLDS:
-        threshold = adaptive_ats_threshold(df)
-        df["ats_threshold_used"] = threshold
+        # Reported bar, on the reported edge's scale: what ats_edge has to
+        # clear, kept so the saved column stays comparable with ats_edge and
+        # with previous runs' parquets.
+        reported_threshold = adaptive_ats_threshold(df, "ats_edge")
+        df["ats_threshold_used"] = reported_threshold
+        # Selection bar, on the selection edge's scale -- the one actually
+        # applied below.
+        threshold = adaptive_ats_threshold(df, "ats_edge_select") if select_unanchored else reported_threshold
+        df["ats_select_threshold_used"] = threshold
         finite = np.isfinite(slope)
         if finite.any():
             logger.info(
@@ -233,12 +275,19 @@ def build_ats_bets(preds_with_market: pl.DataFrame, margin_std: float) -> pl.Dat
                 f"(shrinkage slope median={np.nanmedian(slope[finite]):.3f}); "
                 f"fixed fallback would be {config.ATS_EDGE_THRESHOLD_POINTS}"
             )
+        if select_unanchored:
+            logger.info(
+                f"[ats] selecting on unanchored edge: select threshold median="
+                f"{np.nanmedian(threshold):.2f} pts vs reported-scale median="
+                f"{np.nanmedian(reported_threshold):.2f} pts"
+            )
     else:
         threshold = config.ATS_EDGE_THRESHOLD_POINTS
         df["ats_threshold_used"] = threshold
+        df["ats_select_threshold_used"] = threshold
 
     df = df.drop(columns=["_ats_resid"])
-    df = regrade_ats(df, threshold)
+    df = regrade_ats(df, threshold, edge_col="ats_edge_select")
     return pl.from_pandas(df)
 
 

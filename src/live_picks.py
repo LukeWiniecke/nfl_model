@@ -37,19 +37,30 @@ from .utils import get_logger
 logger = get_logger(__name__)
 
 
-def _live_ats_threshold(hist_ats_bets: pl.DataFrame, live: pd.DataFrame) -> np.ndarray:
+def _live_ats_threshold(
+    hist_ats_bets: pl.DataFrame, live: pd.DataFrame, hist_edge_col: str | None = None
+) -> np.ndarray:
     """Live analogue of backtesting.adaptive_ats_threshold: the same
     shrinkage-and-vig derivation, but with one slope fit on ALL graded
     history rather than season-by-season (there is only one batch of upcoming
     games to apply it to). Without this the live board was selecting picks at
     the old fixed 1.5-point bar while the backtest that justified it now uses
     a derived one nearly 3x higher -- i.e. the thing being bet would not have
-    been the thing that was validated."""
+    been the thing that was validated.
+
+    `hist_edge_col` names the historical edge column the slope is fit on, so
+    the bar comes back on the same scale as the edge it will be compared
+    against. The default reproduces the reported edge; the live board passes
+    the selection edge (config.ATS_SELECT_ON_UNANCHORED)."""
     hist = hist_ats_bets.filter(
         pl.col("home_margin").is_not_null() & pl.col("spread_line").is_not_null()
     ).to_pandas()
+    if hist_edge_col is not None and hist_edge_col in hist.columns:
+        hist_edge = hist[hist_edge_col].to_numpy(dtype=float)
+    else:
+        hist_edge = (hist["predicted_margin"] - hist["spread_line"]).to_numpy()
     slope, sd = fit_edge_shrinkage_all_history(
-        (hist["predicted_margin"] - hist["spread_line"]).to_numpy(),
+        hist_edge,
         (hist["home_margin"] - hist["spread_line"]).to_numpy(),
     )
     if not np.isfinite(slope) or not np.isfinite(sd):
@@ -114,12 +125,31 @@ def build_upcoming_board(
     df["ml_edge"] = df["model_home_prob"] - df["market_home_prob_no_vig"]
 
     # Selection rules, carried over from the backtest so the live board and
-    # the validated backtest agree on what counts as a pick.
+    # the validated backtest agree on what counts as a pick -- including the
+    # split between the REPORTED edge (market-anchored, shown on the board)
+    # and the edge bets are SELECTED on (unanchored, the scale the thresholds
+    # were validated on). See config.ATS_SELECT_ON_UNANCHORED and
+    # backtesting.build_ats_bets, which this mirrors exactly.
+    select_unanchored = (
+        config.ATS_SELECT_ON_UNANCHORED
+        and "predicted_margin_unanchored" in df.columns
+        and "ats_edge_select" in hist_ats_bets.columns
+    )
+    if select_unanchored:
+        df["ats_edge_select"] = df["predicted_margin_unanchored"] - df["spread_line"]
+    else:
+        df["ats_edge_select"] = df["ats_edge"]
+
     if config.USE_ADAPTIVE_THRESHOLDS:
         df["ats_threshold_used"] = _live_ats_threshold(hist_ats_bets, df)
+        df["ats_select_threshold_used"] = (
+            _live_ats_threshold(hist_ats_bets, df, "ats_edge_select")
+            if select_unanchored else df["ats_threshold_used"]
+        )
     else:
         df["ats_threshold_used"] = config.ATS_EDGE_THRESHOLD_POINTS
-    df["ats_qualifies"] = df["ats_edge"].abs() > df["ats_threshold_used"]
+        df["ats_select_threshold_used"] = config.ATS_EDGE_THRESHOLD_POINTS
+    df["ats_qualifies"] = df["ats_edge_select"].abs() > df["ats_select_threshold_used"]
     df["ats_edge_shrunk"] = df["ats_edge"] * _live_shrinkage_slope(hist_ats_bets)
 
     df["ml_threshold_used"] = config.ML_EDGE_THRESHOLD_PROB
