@@ -16,3 +16,6 @@ logs/
 # only summary.txt (committed each iteration) is meant to survive in git.
 run.log
 results.tsv
+
+# Autoresearch sep19: machine-readable scorer output, regenerated every run
+summary.json

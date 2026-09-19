@@ -318,3 +318,69 @@ progress.png                 — output of plot_progress.py (committed each iter
 run.log                      — output of main.py + autoresearch_eval.py (gitignored)
 program.md                   — these instructions (human edits over time)
 ```
+
+## Run 2 (branch `autoresearch/sep19`): accuracy & calibration track
+
+The first run (item 18 in README.md) optimized development-era ATS ROI
+alone. This run adds a second objective, at the human's request: make the
+ensemble **more accurate and better calibrated against the market**, not
+just more profitable on the backtest. The motivating measurement is the
+edge-shrinkage slope of ~0.18: only about a fifth of the ensemble's
+disagreement with the closing line is real, yet its reported margin, cover
+probability and win probability all use the unshrunk prediction. That is
+why the Diagnostics tab shows the model losing to the market on MAE/Brier
+and why the reliability curve is off.
+
+**Scorer.** `scripts/autoresearch_eval.py` was extended BEFORE this run
+started and is frozen for its duration. Its first eleven lines are
+byte-for-byte the original ROI report (every `Select-String` pattern above
+still works). After them it reports, per era, the ensemble's MAE/RMSE vs
+the closing line, Brier vs the de-vigged moneyline, Brier of the cover
+probability, expected calibration error (ECE) and calibration slope of
+both probabilities, and the median shrinkage slope / ATS threshold actually
+used. The same numbers are written to `summary.json`.
+
+**Keep rules for this run.** A change is kept if it passes EITHER track
+below, subject to the common guards. Both tracks are evaluated on the
+development era only; the holdout is a directional sanity check, exactly as
+in Gate C.
+
+Common guards (all must hold, no exceptions):
+- **G1 (= Gate A):** development ATS `n_bets` >= 50% of the baseline's.
+- **G2 (moneyline guard):** development ML `n_bets` >= 50% of the
+  baseline's, unless the experiment itself changes ML bet selection on
+  purpose -- in which case the new ML bet count and both eras' ML ROI must
+  be recorded in `results.tsv` notes and judged explicitly.
+
+ROI track (unchanged from above): Gate B (development ATS ROI strictly
+higher) and Gate C (net improvement across both eras).
+
+Accuracy track:
+- development MAE gap vs market improves by at least 0.01 points, AND the
+  development Brier-ML gap vs market does not get worse (a change that
+  targets only one of the two must leave the other within 0.0005);
+- AND holdout MAE gap does not get worse;
+- AND development ATS ROI stays within 1.5pp of the baseline AND holdout
+  ATS ROI within 2.0pp -- accuracy is never bought with ROI. README item 17
+  (MAE-tuned hyperparameters destroyed ROI) is the failure this clause
+  exists to stop.
+
+When a change passes one track and narrowly fails the other, record both
+verdicts in `results.tsv` and let the human in the loop decide; the notes
+column must say why.
+
+**Parallel protocol.** Experiments run in detached git worktrees
+(`C:\Users\USER\nfl_wt\w0` .. `w5`), each with its own copy
+of `data/raw`, driven by the main repo's `.venv\Scripts\python.exe` with
+`OMP_NUM_THREADS=3` and `POLARS_MAX_THREADS=3`. Verified before the run: a
+worktree run is byte-identical to the main-repo run for the ensemble's ATS
+and ML bet tables. Each experiment: reset the worktree to the base commit,
+make ONE change, commit it there, run `main.py` then the scorer, report
+`summary.json` and the commit hash. Winners are cherry-picked onto
+`autoresearch/sep19` in the main repo, one per round (greedy forward
+selection); other passing candidates are re-tested on the new base in the
+next round, since kept changes interact. `results.tsv` keeps its columns;
+the notes column carries the accuracy numbers. The previous run's ledger is
+preserved as `results_aug18.tsv`.
+
+Everything else in this file applies unchanged.
