@@ -155,6 +155,17 @@ def build_upcoming_board(
             for c in ("model_home_prob_select_raw", "predicted_margin_unanchored", "predicted_std_unanchored")
         )
     )
+    if config.ML_MARKET_MODE == "legacy_selection" and not ml_select_legacy:
+        # Silent fall-through here would put the live board back on the
+        # anchored edge -- the rejected regime that places almost no
+        # moneyline bets -- while every label still said "legacy_selection".
+        # The backtest logs its split; this is the live counterpart.
+        logger.warning(
+            f"[{name}] ML_MARKET_MODE is 'legacy_selection' but the legacy columns are missing "
+            "(stale outputs/backtests, or a model with no anchored ensemble); selecting the "
+            "moneyline on the REPORTED anchored edge instead, which is not the validated book. "
+            "Rerun main.py to regenerate the backtest tables."
+        )
     if ml_select_legacy:
         dof_select = fit_dof_all_history(
             hist_ml_bets["home_margin"].to_numpy(),

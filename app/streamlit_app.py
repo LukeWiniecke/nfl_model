@@ -102,24 +102,62 @@ def load_contributions(model: str) -> pl.DataFrame | None:
     return pl.read_parquet(path)
 
 
+def selection_edge_col(pdf: pd.DataFrame, market: str) -> str:
+    """The column the PIPELINE decided bets on, which is not always the one it
+    reports.
+
+    Since the ensemble became market-anchored, the reported edge and the
+    selection edge are different quantities. For the spread the two are the
+    same ranking (anchoring multiplies the edge by one positive scalar per
+    season), but for the moneyline they are not: the anchored probability adds
+    a per-game intercept and divides by a per-game std, and the rank
+    correlation between the two selection magnitudes is about 0.25. So the
+    pipeline reports the anchored, calibrated probability -- whose Brier now
+    beats the market -- while selecting on the frozen legacy one, and the
+    dashboard has to follow it or it shows a book nobody validated. Measured
+    on the shipped tables before this existed: regrading the moneyline on the
+    reported edge gave 11 bets against the saved book's 647, and the spread
+    573 against 788.
+
+    Falls back to the reported column when a parquet predates the split.
+    """
+    fallback = "ats_edge" if market == "ats" else "ml_edge"
+    preferred = "ats_edge_select" if market == "ats" else "ml_edge_select"
+    return preferred if preferred in pdf.columns else fallback
+
+
+def pipeline_threshold_col(pdf: pd.DataFrame, market: str) -> str | None:
+    """Name of the threshold column pipeline_threshold will actually use, or
+    None when it falls back to the fixed config constant. Kept separate so the
+    sidebar caption describes the same bar the regrade applies -- they read
+    different columns once, and the caption quietly described a bar nothing
+    was using."""
+    select_col = "ats_select_threshold_used" if market == "ats" else "ml_select_threshold_used"
+    report_col = "ats_threshold_used" if market == "ats" else "ml_threshold_used"
+    for col in (select_col, report_col):
+        if col in pdf.columns:
+            return col
+    return None
+
+
 def pipeline_threshold(pdf: pd.DataFrame, market: str):
     """The per-game bar the pipeline ACTUALLY placed its bets at, read back
-    from the stored `ats_threshold_used` / `ml_threshold_used` column, so the
-    dashboard's default view is the validated bet book rather than one fixed
-    bar applied to every game.
+    from the stored threshold column, so the dashboard's default view is the
+    validated bet book rather than one fixed bar applied to every game.
 
     Before this existed every tab regraded at a single scalar defaulting to
     config.ATS_EDGE_THRESHOLD_POINTS, while the pipeline derives a different
     bar per game from the walk-forward shrinkage slope and the odds on offer
-    (backtesting.adaptive_ats_threshold). The two books differed in size and
-    ROI, and the gap grows roughly 4x under a market-anchored ensemble, whose
-    edges are a quarter the size of the 3.5-point default. Falls back to the
-    fixed config default wherever the column is missing (older parquets, or a
-    market the pipeline still runs at a fixed bar) or null.
+    (backtesting.adaptive_ats_threshold). Prefers the *_select_threshold_used
+    column, which is the bar applied to the selection edge above; the older
+    ats_threshold_used is on the reported scale and pairing it with the
+    selection edge would be wrong in both directions. Falls back to the fixed
+    config default wherever no column exists (older parquets, or a market the
+    pipeline runs at a fixed bar) or a value is null.
     """
-    col = "ats_threshold_used" if market == "ats" else "ml_threshold_used"
     default = config.ATS_EDGE_THRESHOLD_POINTS if market == "ats" else config.ML_EDGE_THRESHOLD_PROB
-    if col not in pdf.columns:
+    col = pipeline_threshold_col(pdf, market)
+    if col is None:
         return float(default)
     return pdf[col].astype(float).fillna(float(default)).to_numpy()
 
@@ -143,7 +181,12 @@ def regraded_bets(model: str, market: str, threshold: float | None) -> pl.DataFr
         return None
     pdf = raw.to_pandas()
     thr = effective_threshold(pdf, market, threshold)
-    pdf = backtesting.regrade_ats(pdf, thr) if market == "ats" else backtesting.regrade_ml(pdf, thr)
+    edge_col = selection_edge_col(pdf, market)
+    pdf = (
+        backtesting.regrade_ats(pdf, thr, edge_col=edge_col)
+        if market == "ats"
+        else backtesting.regrade_ml(pdf, thr, edge_col=edge_col)
+    )
     return evaluation.add_bet_context(pl.from_pandas(pdf))
 
 
@@ -610,16 +653,20 @@ predictions = load_predictions(model)
 bets_ctx = regraded_bets(model, market, threshold)
 
 if threshold is None and bets_ctx is not None:
-    _thr_col = "ats_threshold_used" if market == "ats" else "ml_threshold_used"
-    if _thr_col in bets_ctx.columns and bets_ctx[_thr_col].null_count() < bets_ctx.height:
+    _pdf = bets_ctx.to_pandas()
+    _thr_col = pipeline_threshold_col(_pdf, market)
+    _edge_col = selection_edge_col(_pdf, market)
+    _selecting = " on the frozen legacy edge" if _edge_col.endswith("_select") else ""
+    if _thr_col is not None and bets_ctx[_thr_col].null_count() < bets_ctx.height:
         _thr = bets_ctx[_thr_col].drop_nulls()
-        st.sidebar.caption(
-            f"Pipeline threshold in use: per game, median {_thr.median():.3g}, "
-            f"range {_thr.min():.3g} to {_thr.max():.3g}."
-        )
+        _lo, _hi = _thr.min(), _thr.max()
+        _desc = f"fixed {_lo:.3g}" if _lo == _hi else f"per game, median {_thr.median():.3g}, range {_lo:.3g} to {_hi:.3g}"
+        st.sidebar.caption(f"Pipeline threshold in use: {_desc}{_selecting}.")
     else:
         _fixed = config.ATS_EDGE_THRESHOLD_POINTS if market == "ats" else config.ML_EDGE_THRESHOLD_PROB
-        st.sidebar.caption(f"Pipeline threshold in use: fixed {_fixed:.3g} (this market carries no per-game bar).")
+        st.sidebar.caption(
+            f"Pipeline threshold in use: fixed {_fixed:.3g} (this market carries no per-game bar){_selecting}."
+        )
 
 if bets_ctx is None or predictions is None:
     st.error(
@@ -677,7 +724,9 @@ with tab_upcoming:
         # by default the per-game bar the pipeline stored on this board
         # (ats_threshold_used / ml_threshold_used) -- routed through the shared
         # helper so the moneyline underdog-only restriction can't go missing.
-        pdf["bet_side"] = backtesting.decide_bet_side(pdf, market, effective_threshold(pdf, market, threshold))
+        pdf["bet_side"] = backtesting.decide_bet_side(
+            pdf, market, effective_threshold(pdf, market, threshold), edge_col=selection_edge_col(pdf, market)
+        )
 
         is_home = pdf["bet_side"] == "home"
         prob_for_side = np.where(is_home, pdf[prob_col], 1.0 - pdf[prob_col])
@@ -766,7 +815,9 @@ with tab_track_record:
             home_odds_col = "home_spread_odds" if market == "ats" else "home_moneyline"
             away_odds_col = "away_spread_odds" if market == "ats" else "away_moneyline"
 
-            pdf["bet_side"] = backtesting.decide_bet_side(pdf, market, effective_threshold(pdf, market, threshold))
+            pdf["bet_side"] = backtesting.decide_bet_side(
+                pdf, market, effective_threshold(pdf, market, threshold), edge_col=selection_edge_col(pdf, market)
+            )
             if market == "ats":
                 home_right = pdf["home_margin"] > pdf["spread_line"]
             else:
