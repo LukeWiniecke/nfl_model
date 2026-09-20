@@ -707,14 +707,21 @@ MIN_CALIBRATION_GAMES = 150
 #                 parameters (slope + intercept), so it can only stretch or
 #                 compress the raw probability, never invent structure.
 #   'isotonic' -- the PREVIOUS value: monotone step function fit by
-#                 sklearn IsotonicRegression. Measured on the ensemble
-#                 baseline it was overfitting ~2,000 (prob, outcome) pairs
-#                 into noise: the isotonic-calibrated ML Brier (0.2181) was
-#                 WORSE than the raw Brier (0.2168), and the calibrated
-#                 cover probability had a calibration slope of 0.003, i.e.
-#                 the recalibrated number carried no relationship to the
-#                 outcome at all. Platt's two parameters cannot manufacture
-#                 that kind of spurious structure.
+#                 sklearn IsotonicRegression. Measured on the market-
+#                 anchored ensemble (round 2, E9 base) it was overfitting
+#                 ~2,000 (prob, outcome) pairs into noise: the isotonic-
+#                 calibrated development ML Brier (0.2140) was WORSE than
+#                 both the raw Brier (0.2120) and the market's (0.2123),
+#                 and the calibrated cover probability had a calibration
+#                 slope of 0.037, i.e. the recalibrated number carried
+#                 almost no relationship to the outcome. Switching to Platt
+#                 took the development ML Brier to 0.2117 -- the first time
+#                 this project's win probability has beaten the market's --
+#                 and the ML calibration slope from 0.702 to 0.995; the
+#                 cover-probability Brier went 0.2537 -> 0.2497 and its
+#                 slope 0.037 -> 0.520. Holdout was mixed. Platt's two
+#                 parameters cannot manufacture isotonic's spurious
+#                 structure.
 CALIBRATION_METHOD = "platt"
 # Platt fit details. Raw probabilities are clipped this far away from 0/1
 # before the logit so a saturated CDF can never produce +/-inf; C is huge so
