@@ -295,6 +295,7 @@ def add_rolling_form(long: pl.DataFrame, epa_splits: pl.DataFrame) -> pl.DataFra
         "off_plays",
     ]
     long = long.with_columns(_rolling_exprs(raw_stat_cols))
+    long = _carry_form_into_unplayed(long, raw_stat_cols)
 
     games_played = pl.col("margin").cum_count().shift(1).over("team").fill_null(0).alias("games_played_career")
     season_games_played = (
@@ -318,6 +319,45 @@ def _rolling_exprs(stat_cols: list[str]) -> list[pl.Expr]:
             shifted.ewm_mean(half_life=config.EWMA_HALFLIFE_GAMES, min_samples=1).over("team").alias(f"{col}_ewm")
         )
     return exprs
+
+
+def _form_cols(stat_cols: list[str]) -> list[str]:
+    """The rolling-form column names _rolling_exprs produces for `stat_cols`."""
+    return [f"{c}_roll{w}" for c in stat_cols for w in config.ROLLING_WINDOWS] + [f"{c}_ewm" for c in stat_cols]
+
+
+def _carry_form_into_unplayed(long: pl.DataFrame, stat_cols: list[str]) -> pl.DataFrame:
+    """Carry each team's last real rolling form forward into its UNPLAYED games.
+
+    _rolling_exprs shifts each raw stat back one game and takes an EWM or
+    rolling mean, so a game's form reflects only the games before it. That
+    is right for every played game and silently breaks one game past the
+    present: an unplayed game has null raw stats, and polars' ewm_mean
+    returns null at every position whose (shifted) input is null, so a
+    team's NEXT game carries real form and every scheduled game after it
+    carries none. modeling._impute then substitutes the training median for
+    six of ridge's fifteen features. rolling_mean skips nulls inside its
+    window, so the roll8 columns survive a few more weeks before going the
+    same way once the whole window is unplayed games.
+
+    Measured on the 2026-09-19 board before this fix: 16 of the 31 games
+    with a posted line -- all of the following week's -- had every team-form
+    feature null, including 4 of the 6 qualifying picks. Invisible in the
+    backtest, where every game has been played; the same failure mode
+    compute_qb_form's carry-forward already handles for the QB features.
+
+    Forward-fills within team (the frame is sorted by team, season, week) and
+    applies the filled value ONLY where margin is null, i.e. genuinely
+    unplayed, so no played row -- including a played game with a pbp data
+    gap -- can change, and the walk-forward backtest stays byte-identical.
+    A team's first unplayed game already holds the right value (its form
+    after the last completed game); the later ones now inherit it.
+    """
+    cols = [c for c in _form_cols(stat_cols) if c in long.columns]
+    unplayed = pl.col("margin").is_null()
+    return long.with_columns(
+        [pl.when(unplayed).then(pl.col(c).forward_fill().over("team")).otherwise(pl.col(c)).alias(c) for c in cols]
+    )
 
 
 def add_opponent_adjusted_form(long: pl.DataFrame) -> pl.DataFrame:
@@ -530,6 +570,28 @@ def compute_referee_features(officials: pl.DataFrame, games: pl.DataFrame) -> pl
     return ref.select(["game_id", "ref_total_resid_ewm"])
 
 
+def _stadium_roof_by_home_team(games: pl.DataFrame) -> pl.DataFrame:
+    """Each team's usual `roof` state at its own stadium: the most common
+    value over its PLAYED, non-neutral home games in the three most recent
+    seasons it has any (ties broken by the more recent value). Used only to
+    fill `roof` on unplayed fixtures nflverse has not populated yet -- see
+    add_game_context_features."""
+    played = games.filter(
+        pl.col("home_margin").is_not_null() & pl.col("roof").is_not_null() & (pl.col("location") != "Neutral")
+    )
+    if played.height == 0:
+        return pl.DataFrame({"home_team": [], "_stadium_roof": []}, schema={"home_team": pl.Utf8, "_stadium_roof": pl.Utf8})
+    latest = played.group_by("home_team").agg(pl.col("season").max().alias("_max_season"))
+    recent = played.join(latest, on="home_team").filter(pl.col("season") >= pl.col("_max_season") - 2)
+    return (
+        recent.group_by(["home_team", "roof"])
+        .agg(pl.len().alias("_n"), pl.col("season").max().alias("_last"))
+        .sort(["home_team", "_n", "_last"], descending=[False, True, True])
+        .unique(subset=["home_team"], keep="first", maintain_order=True)
+        .select("home_team", pl.col("roof").alias("_stadium_roof"))
+    )
+
+
 def add_game_context_features(
     games: pl.DataFrame,
     spreadspoke_ctx: pl.DataFrame | None = None,
@@ -563,13 +625,32 @@ def add_game_context_features(
     compute_qb_form's carried-forward starter assumption (see its docstring)
     might be wrong for an upcoming game.
     """
-    is_dome = pl.col("roof").is_in(["dome", "closed"])
-    df = games.with_columns(
+    # nflverse leaves `roof` null on some FUTURE fixtures -- specifically at
+    # retractable-roof stadiums (ATL, HOU, ARI, DAL, IND), whose open/closed
+    # state is only recorded once the game is played. Every one of those
+    # teams has been "closed" in effectively every recent home game, so
+    # leaving is_dome null (median-imputed to 0, "outdoors") told the live
+    # model the opposite of the truth for exactly the teams that play
+    # indoors: 6 of 31 upcoming games on the 2026-09-19 board, 41 of 255
+    # unplayed 2026 games overall. Played games are never null. For an
+    # UNPLAYED, non-neutral game with no roof, use the home team's usual
+    # roof state at its own stadium instead (the most common value over its
+    # recent played home games). Played rows are untouched, so the backtest
+    # is byte-identical; neutral-site games stay null (the venue is not the
+    # home team's stadium, and guessing there is worse than the median).
+    df = games.join(_stadium_roof_by_home_team(games), on="home_team", how="left")
+    roof_eff = (
+        pl.when(pl.col("roof").is_null() & pl.col("home_margin").is_null() & (pl.col("location") != "Neutral"))
+        .then(pl.col("_stadium_roof"))
+        .otherwise(pl.col("roof"))
+    )
+    is_dome = roof_eff.is_in(["dome", "closed"])
+    df = df.with_columns(
         (pl.col("location") == "Neutral").cast(pl.Int8).alias("neutral_site"),
         is_dome.cast(pl.Int8).alias("is_dome"),
         pl.when(is_dome).then(70.0).otherwise(pl.col("temp").fill_null(58.0)).alias("temp_filled"),
         pl.when(is_dome).then(0.0).otherwise(pl.col("wind").fill_null(8.0)).alias("wind_filled"),
-    )
+    ).drop("_stadium_roof")
     if spreadspoke_ctx is not None:
         df = df.join(spreadspoke_ctx, on=["gameday", "home_team", "away_team"], how="left")
 
