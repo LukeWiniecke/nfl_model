@@ -143,9 +143,15 @@ def main():
 
     logger.info("Computing per-game EPA/success-rate splits from pbp...")
     epa_splits = feature_engineering.compute_game_epa_splits(raw["pbp"])
+    # Penalties COMMITTED per team-game, attributed via penalty_team (posteam
+    # is the offense, and ~41% of penalties are on the defense). Creates
+    # pen_count/pen_yards/pen_presnap rolling-form columns; no model uses them
+    # unless they are named in a feature list, and LightGBM's suffix
+    # auto-detection explicitly excludes them (modeling.gbm_feature_columns).
+    penalty_splits = feature_engineering.compute_game_penalty_splits(raw["pbp"])
 
     logger.info("Building rolling team-form features...")
-    team_long_form = feature_engineering.add_rolling_form(team_long, epa_splits)
+    team_long_form = feature_engineering.add_rolling_form(team_long, epa_splits, penalty_splits)
 
     logger.info("Computing QB-level form (starter identification, rolling EPA, continuity)...")
     # "margin" is included so compute_qb_form can tell a genuinely UNPLAYED

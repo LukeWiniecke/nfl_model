@@ -132,7 +132,12 @@ def gbm_feature_columns(df: pl.DataFrame) -> list[str]:
     # config.py) -- excluded here even though it'd otherwise auto-match the
     # suffix above, same as every other feature this project tests on one
     # market at a time rather than letting it leak in via auto-detection.
-    cols = [c for c in cols if not c.startswith("off_plays")]
+    #
+    # pen_* (penalties committed) excluded for the same reason. This suffix
+    # auto-detection is how qb_cpoe_ewm silently re-entered LightGBM after
+    # being dropped from the explicit ridge lists (see config.py), so any new
+    # raw stat must be opted IN here rather than left to match by accident.
+    cols = [c for c in cols if not c.startswith(("off_plays", "pen_"))]
     cols += [
         "elo_diff", "rest_diff", "div_game", "qb_continuity_diff",
         "neutral_site", "is_dome",
@@ -155,7 +160,8 @@ def gbm_total_feature_columns(df: pl.DataFrame) -> list[str]:
     cols = [c for c in df.columns if c.endswith(suffixes)]
     # off_plays (pace) deliberately excluded here: kept for ridge_total (see
     # config.py), but reverted for LightGBM -- consistently made it worse.
-    cols = [c for c in cols if not c.startswith("off_plays")]
+    # pen_* excluded by the same opt-in rule as in gbm_feature_columns.
+    cols = [c for c in cols if not c.startswith(("off_plays", "pen_"))]
     # temp_filled/wind_filled removed -- see config.WEATHER_FEATURES_DISABLED.
     cols += ["div_game", "neutral_site", "is_dome"]
     return _drop_disabled(cols, df)

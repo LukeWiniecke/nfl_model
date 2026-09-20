@@ -52,6 +52,82 @@ def compute_game_epa_splits(pbp: pl.DataFrame) -> pl.DataFrame:
     return off.join(deff, on=["game_id", "team"], how="inner")
 
 
+# Penalties charged before the snap, or for having the wrong personnel on the
+# field. These are the discipline signal: unlike holding or pass interference,
+# they are not a by-product of how aggressively a team plays, so they are far
+# less confounded with scheme and with facing a good opponent. Kept as a
+# separate stat from total penalties for exactly that reason.
+PRESNAP_PENALTY_TYPES = [
+    "False Start",
+    "Delay of Game",
+    "Neutral Zone Infraction",
+    "Encroachment",
+    "Defensive Offside",
+    "Offside on Free Kick",
+    "Illegal Formation",
+    "Illegal Shift",
+    "Illegal Motion",
+    "Illegal Substitution",
+    "Defensive Too Many Men on Field",
+    "Offensive Too Many Men on Field",
+    "Delay of Kickoff",
+]
+
+
+def compute_game_penalty_splits(pbp: pl.DataFrame) -> pl.DataFrame:
+    """One row per (game_id, team): penalties that team COMMITTED in that
+    game -- count, yards, and the pre-snap subset.
+
+    Attribution comes from `penalty_team`, not `posteam`: a penalty play's
+    posteam is whoever had the ball, and roughly 41% of penalties are on the
+    defense, so counting by posteam would assign nearly half of them to the
+    wrong side. penalty_team is non-null on every penalty play in the data.
+
+    Deliberately NOT filtered to run/pass plays, unlike compute_game_epa_splits:
+    penalties on kickoffs, punts, extra points and between plays are real
+    penalties and belong in a discipline measure. A team with no penalties in
+    a game correctly gets 0 rather than a missing row, because the frame is
+    built from every team-game in the pbp and then filled.
+
+    Penalties are already in the model implicitly -- penalty yardage moves
+    field position, which moves the EPA of subsequent plays -- so these
+    features are the EXPLICIT discipline signal, which is a different thing
+    and may or may not add anything on top. Measured, not assumed.
+    """
+    pbp = clean_pbp(pbp)
+
+    # Every team-game in the data, so a clean game becomes a zero rather than
+    # a null that gets median-imputed into "averagely penalised".
+    team_games = pl.concat(
+        [
+            pbp.select("game_id", pl.col("posteam").alias("team")),
+            pbp.select("game_id", pl.col("defteam").alias("team")),
+        ]
+    ).filter(pl.col("team").is_not_null()).unique()
+
+    pen = pbp.filter((pl.col("penalty") == 1) & pl.col("penalty_team").is_not_null())
+    if "penalty_type" in pen.columns:
+        presnap = pl.col("penalty_type").is_in(PRESNAP_PENALTY_TYPES)
+    else:  # a pbp cache written before penalty_type was kept
+        presnap = pl.lit(False)
+
+    agg = (
+        pen.group_by(["game_id", "penalty_team"])
+        .agg(
+            pl.len().alias("pen_count"),
+            pl.col("penalty_yards").fill_null(0).sum().alias("pen_yards"),
+            presnap.cast(pl.Int32).sum().alias("pen_presnap"),
+        )
+        .rename({"penalty_team": "team"})
+    )
+
+    return team_games.join(agg, on=["game_id", "team"], how="left").with_columns(
+        pl.col("pen_count").fill_null(0).cast(pl.Float64),
+        pl.col("pen_yards").fill_null(0).cast(pl.Float64),
+        pl.col("pen_presnap").fill_null(0).cast(pl.Float64),
+    )
+
+
 def compute_qb_form(
     player_stats: pl.DataFrame, team_schedule: pl.DataFrame, depth_chart_starters: pl.DataFrame | None = None
 ) -> pl.DataFrame:
@@ -283,17 +359,31 @@ def compute_qb_ngs_form(player_stats: pl.DataFrame, ngs_passing: pl.DataFrame, t
     return pl.concat([played_out, carried_out], how="diagonal_relaxed")
 
 
-def add_rolling_form(long: pl.DataFrame, epa_splits: pl.DataFrame) -> pl.DataFrame:
+def add_rolling_form(
+    long: pl.DataFrame, epa_splits: pl.DataFrame, penalty_splits: pl.DataFrame | None = None
+) -> pl.DataFrame:
     """Join per-game team stats onto the long table, then compute shifted
-    rolling means so each row only reflects form BEFORE that game."""
+    rolling means so each row only reflects form BEFORE that game.
+
+    `penalty_splits` (compute_game_penalty_splits) is optional so an older
+    pbp cache without the penalty attribution columns still works; when it is
+    absent the penalty stats are simply not created, and nothing downstream
+    looks for them.
+    """
     long = long.join(epa_splits, on=["game_id", "team"], how="left")
+
+    penalty_stats: list[str] = []
+    if penalty_splits is not None:
+        long = long.join(penalty_splits, on=["game_id", "team"], how="left")
+        penalty_stats = [c for c in ("pen_count", "pen_yards", "pen_presnap") if c in long.columns]
+
     long = long.sort(["team", "season", "week"])
 
     raw_stat_cols = [
         "margin", "off_epa_play", "off_success_rate", "off_pass_epa", "off_rush_epa",
         "def_epa_allowed_play", "def_success_rate_allowed", "def_pass_epa_allowed", "def_rush_epa_allowed",
         "off_plays",
-    ]
+    ] + penalty_stats
     long = long.with_columns(_rolling_exprs(raw_stat_cols))
     long = _carry_form_into_unplayed(long, raw_stat_cols)
 

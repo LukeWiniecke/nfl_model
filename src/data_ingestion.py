@@ -90,7 +90,19 @@ def load_pbp(force_refresh: bool = False) -> pl.DataFrame:
         "rush",
         "epa",
         "success",
+        # Penalties. `penalty` alone (all that was kept until 2026-09-20) is
+        # not usable on its own: it flags that a penalty occurred on the play,
+        # but `posteam` is the OFFENSE and ~41% of penalties are on the
+        # defense, so there was no way to tell who committed it. penalty_team
+        # gives the attribution, penalty_yards the magnitude, penalty_type the
+        # pre-snap/discipline split. All three are non-null on every penalty
+        # play in the seasons checked. Adding them invalidates any pbp cache
+        # written before that date -- delete data/raw/nflverse/pbp.parquet
+        # once after upgrading, or pass --refresh.
         "penalty",
+        "penalty_team",
+        "penalty_yards",
+        "penalty_type",
     ]
 
     logger.info(f"Downloading play-by-play for seasons {SEASONS[0]}-{SEASONS[-1]} (this can take a while)")
