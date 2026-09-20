@@ -10,7 +10,15 @@ the production model) · **LIMITATION** (known, not fixable with current data).
 
 ---
 
-## 1. Team rolling form is null for any game beyond the current week — OPEN
+## 1. Team rolling form is null for any game beyond the current week — FIXED (2afa00d)
+
+**Status:** `feature_engineering._carry_form_into_unplayed` forward-fills
+within team into unplayed rows only. Verified on 2026-09-20: all eleven
+prediction and bet tables byte-identical to the baseline run, played rows of
+the modeling table identical, and the six team-form features have 0 nulls
+on all 31 upcoming games (was 16) and on all 255 unplayed 2026 games.
+Twenty of 31 live predictions changed; qualifying picks went from 1 ATS /
+6 ML to 2 ATS / 5 ML. Independently reviewed as part of round 3.
 
 **Where:** `feature_engineering._rolling_exprs` / `add_rolling_form`.
 **What:** rolling form is `shift(1).over(team)` then `ewm_mean(min_samples=1)`.
@@ -28,7 +36,14 @@ carry-forward bug in README item 12. The `*_roll8` versions survive because
 rows only. Validation: backtest output must stay byte-identical (no played
 row may change) and live nulls must go to zero.
 
-## 2. Dashboard threshold slider does not match the pipeline's bet book — OPEN
+## 2. Dashboard threshold slider does not match the pipeline's bet book — FIXED (dba6ed2)
+
+**Status:** sidebar "Threshold source" switch, default "Pipeline (per game,
+adaptive)", regrades with the stored `ats_threshold_used` /
+`ml_threshold_used` column and falls back to the fixed default where a
+parquet has none; "Manual" keeps the old slider behaviour for what-ifs.
+Verified headless with Streamlit's AppTest in ATS-pipeline, ATS-manual and
+ML-pipeline modes: no exceptions.
 
 **Where:** `app/streamlit_app.py` `regraded_bets()` and the two
 `decide_bet_side` call sites in the Upcoming picks and Track record tabs.
@@ -52,7 +67,17 @@ rating values were correct; only the presentation was wrong.
 **Fix:** `played` flag on the history; chart ends on the current rating;
 leaderboard labelled from the last completed game.
 
-## 4. Weekly refresh scheduled task dies silently after wake-from-sleep — OPEN
+## 4. Weekly refresh scheduled task dies silently after wake-from-sleep — PARTIALLY FIXED
+
+**Status:** task re-registered 2026-09-20 with `-WindowStyle Hidden` (the
+console that could be closed no longer appears). The more robust fix, an
+S4U principal so the task does not depend on the interactive session at
+all, was refused with "Access is denied" from an unelevated shell;
+`scripts/setup_weekly_refresh.ps1` now tries S4U first and falls back, so
+rerunning it from an elevated PowerShell upgrades the task. A manual
+`Start-ScheduledTask` test is scheduled after round 3 finishes (it rewrites
+the outputs the reviewers are reading). Next scheduled run: Tue 2026-09-22
+08:00. Root cause remains inferred, not proven.
 
 **Where:** Windows task "NFL Model Weekly Refresh" (`scripts/setup_weekly_refresh.ps1`).
 **What:** died 2026-08-18 and 2026-09-15 with result 0xC000013A
@@ -84,12 +109,19 @@ of 1.0, documented "measured inert", binds in 2017-19. Harmless in the
 production (unanchored) model; the reason round-2's anchored variants lost
 bets. Round-3 E13 is the fix.
 
-## 7. `is_dome` null for some upcoming games — OPEN (investigating)
+## 7. `is_dome` null for upcoming games at retractable-roof stadiums — FIXED (2afa00d)
 
 **Where:** `feature_engineering.add_game_context_features`, from `games.roof`.
-**What:** 6 of 31 upcoming games had `is_dome` null on 2026-09-19 and were
-median-imputed (to 0, i.e. "outdoor"). Cause under investigation: likely
-nflverse leaves `roof` null on some future fixtures.
+**What:** nflverse leaves `roof` null on future fixtures at retractable-roof
+stadiums (ATL, HOU, ARI, DAL, IND), whose open/closed state is only
+recorded once the game is played; 41 of 255 unplayed 2026 games, 6 of the
+31 with a line. All five teams have been "closed" in effectively every
+recent home game, so the median imputation (0, "outdoors") told the model
+the opposite of the truth for exactly the teams that play indoors.
+**Fix:** `_stadium_roof_by_home_team` fills from the team's most common
+roof over its last three seasons of played home games; neutral-site games
+stay null (2 remain, both neutral). Played rows untouched; backtest
+byte-identical.
 
 ## 8. Injury features null for next-week games — LIMITATION
 
