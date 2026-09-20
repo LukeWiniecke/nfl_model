@@ -346,6 +346,22 @@ def _anchor_log(base_cols: list[str], b: np.ndarray, market_col: str) -> str:
     return " ".join(f"b({c.replace('pred_', '')})={v:.3f}" for c, v in zip(base_cols, b)) + f" anchor={market_col}"
 
 
+def _legacy_meta_predict(X_train, y_train, X_test, base_cols: list[str]) -> tuple[np.ndarray, str]:
+    """The ENSEMBLE_MARKET_ANCHOR = None ensemble, fit on the side: the same
+    Ridge(alpha=1.0) WITH intercept on the base-model predictions alone
+    (predicted = a + w * pred_ridge), on the same rows the `else` branches of
+    walk_forward_ensemble / predict_upcoming_ensemble would use. In
+    "constrained" mode it fills `{pred_col}_unanchored`, so bet selection
+    (config.ATS_SELECT_ON_UNANCHORED) runs on exactly the edge the README
+    validated its thresholds on and reproduces that bet book. Frame-agnostic:
+    pandas from _prep_xy in walk-forward, the live pandas frame for upcoming
+    games -- both are indexed by column name."""
+    meta = Ridge(alpha=1.0)
+    meta.fit(X_train[base_cols], y_train)
+    weights = " ".join(f"weight({c.replace('pred_', '')})={w:.4f}" for c, w in zip(base_cols, meta.coef_))
+    return meta.predict(X_test[base_cols]), f"{weights} intercept={meta.intercept_:.4f}"
+
+
 def walk_forward_ensemble(
     modeling_table: pl.DataFrame, ridge_result: WalkForwardResult, lgbm_result: WalkForwardResult,
     target_col: str = "home_margin", pred_col: str = "predicted_margin", model_name: str = "ensemble",
@@ -402,14 +418,21 @@ def walk_forward_ensemble(
             train_pred = m_train + E_train @ b
             m_test, E_test = _anchor_arrays(test_df, base_cols, market_col)
             pred = m_test + E_test @ b
-            # Pre-anchor prediction, i.e. b = 1: the base models' own output,
-            # which for a single base model is pred_ridge exactly. Reported
-            # alongside `pred` so the betting layer can SELECT on the
-            # unanchored scale its thresholds were validated on while
-            # everything still REPORTS the anchored margin -- see
-            # config.ATS_SELECT_ON_UNANCHORED.
-            pred_unanchored = m_test + E_test.mean(axis=1)
-            fit_log = _anchor_log(base_cols, b, market_col)
+            # The LEGACY ensemble prediction: the one-feature meta-ridge on
+            # the base predictions that the `else` branch below fits when
+            # ENSEMBLE_MARKET_ANCHOR is None -- same Ridge(alpha=1.0), same
+            # columns, same train pool (strictly earlier seasons' out-of-fold
+            # rows; in this mode meta_cols == base_cols, so X_train IS that
+            # pool). Reported alongside `pred` so the betting layer can SELECT
+            # on exactly the edge the README validated its thresholds on
+            # (a_S + w_S * pred_ridge - line) while everything still REPORTS
+            # the anchored margin -- see config.ATS_SELECT_ON_UNANCHORED.
+            # NOT raw pred_ridge: the betting layer's through-origin shrinkage
+            # slope and the bar derived from it are not invariant to the meta
+            # intercept, so selecting on raw pred_ridge moved the bet
+            # universe (r3-E18: 813 dev bets against the validated 692).
+            pred_unanchored, legacy_log = _legacy_meta_predict(X_train, y_train, X_test, base_cols)
+            fit_log = f"{_anchor_log(base_cols, b, market_col)} | legacy {legacy_log}"
         else:
             meta = Ridge(alpha=1.0)
             meta.fit(X_train, y_train)
@@ -615,11 +638,13 @@ def predict_upcoming_ensemble(
         train_pred = m_hist + E_hist @ b
         m_live, E_live = _anchor_arrays(live, base_cols, market_col)
         live[pred_col] = m_live + E_live @ b
-        # Pre-anchor prediction -- see walk_forward_ensemble. Set BEFORE the
-        # base-model columns are dropped below, since for one base model it
-        # is pred_ridge itself.
-        live[f"{pred_col}_unanchored"] = m_live + E_live.mean(axis=1)
-        fit_log = _anchor_log(base_cols, b, market_col)
+        # Legacy ensemble prediction for selection -- see walk_forward_ensemble.
+        # Fit on ALL historical out-of-fold rows (X_train, no season held
+        # out), exactly as the `else` branch does for the live frame when
+        # ENSEMBLE_MARKET_ANCHOR is None. Set BEFORE the base-model columns
+        # are dropped below, since it reads them off `live`.
+        live[f"{pred_col}_unanchored"], legacy_log = _legacy_meta_predict(X_train, y_train, live, base_cols)
+        fit_log = f"{_anchor_log(base_cols, b, market_col)} | legacy {legacy_log}"
     else:
         meta = Ridge(alpha=1.0)
         meta.fit(X_train, y_train)

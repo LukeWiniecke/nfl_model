@@ -832,8 +832,8 @@ MIN_SHRINKAGE_GAMES = 600
 SHRINKAGE_SLOPE_FLOOR = 0.02
 SHRINKAGE_SLOPE_CAP = 1.0
 
-# Select ATS bets on the UNANCHORED ridge edge, while still REPORTING the
-# market-anchored margin (see ENSEMBLE_MARKET_ANCHOR) everywhere.
+# Select ATS bets on the UNANCHORED (legacy ensemble) edge, while still
+# REPORTING the market-anchored margin (see ENSEMBLE_MARKET_ANCHOR) everywhere.
 #
 # The principle: anchoring is a monotone rescaling of the selection signal,
 # so it cannot add or remove real information about WHICH games to bet.
@@ -861,6 +861,20 @@ SHRINKAGE_SLOPE_CAP = 1.0
 # the closing line) but hand the selection machinery the unanchored edge it
 # was validated on. True decouples the two; False restores r2-E9's behaviour
 # of selecting on whatever scale the report happens to be on.
+#
+# WHAT the selection signal is (r3b-E19): the LEGACY ensemble prediction --
+# the one-feature Ridge(alpha=1.0) meta-regression WITH intercept on
+# pred_ridge (predicted = a_S + w_S * pred_ridge, w ~0.9-1.0, refit
+# walk-forward each season on strictly earlier seasons' out-of-fold rows)
+# that walk_forward_ensemble computes when ENSEMBLE_MARKET_ANCHOR is None,
+# stored as predicted_margin_unanchored (modeling._legacy_meta_predict).
+# Not raw pred_ridge: r3-E18 selected on raw pred_ridge and placed 813
+# development bets against the validated 692, because the betting layer's
+# through-origin shrinkage slope and the bar derived from it are not
+# invariant to that intercept. With the legacy prediction as the selection
+# edge, ats_edge_select and ats_select_threshold_used are the baseline's
+# ats_edge and ats_threshold_used, so the bet book is exactly the one the
+# README validated while the margin and probabilities stay market-anchored.
 ATS_SELECT_ON_UNANCHORED = True
 
 # Moneyline: restrict to underdog-side bets only.
