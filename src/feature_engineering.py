@@ -327,36 +327,59 @@ def _form_cols(stat_cols: list[str]) -> list[str]:
 
 
 def _carry_form_into_unplayed(long: pl.DataFrame, stat_cols: list[str]) -> pl.DataFrame:
-    """Carry each team's last real rolling form forward into its UNPLAYED games.
+    """Give every UNPLAYED game the team's form as of its last completed game.
 
-    _rolling_exprs shifts each raw stat back one game and takes an EWM or
-    rolling mean, so a game's form reflects only the games before it. That
-    is right for every played game and silently breaks one game past the
-    present: an unplayed game has null raw stats, and polars' ewm_mean
-    returns null at every position whose (shifted) input is null, so a
-    team's NEXT game carries real form and every scheduled game after it
-    carries none. modeling._impute then substitutes the training median for
-    six of ridge's fifteen features. rolling_mean skips nulls inside its
-    window, so the roll8 columns survive a few more weeks before going the
-    same way once the whole window is unplayed games.
+    _rolling_exprs shifts each raw stat back one game and takes an EWM or a
+    fixed-window mean, so a game's form reflects only the games before it.
+    That is right for every played game and wrong for every scheduled one,
+    in two different ways, because an unplayed game contributes null raw
+    stats:
 
-    Measured on the 2026-09-19 board before this fix: 16 of the 31 games
-    with a posted line -- all of the following week's -- had every team-form
-    feature null, including 4 of the 6 qualifying picks. Invisible in the
-    backtest, where every game has been played; the same failure mode
-    compute_qb_form's carry-forward already handles for the QB features.
+      * ewm_mean returns null at every position whose shifted input is null,
+        so a team's NEXT game carries real form and every game after it
+        carries none. modeling._impute then substitutes the training median
+        for six of ridge's fifteen features. On the 2026-09-19 board that was
+        16 of 31 games with a posted line -- all of the following week's --
+        including 4 of the 6 qualifying picks.
+      * rolling_mean(min_samples=1) instead SKIPS nulls inside its window, so
+        those columns are not null; they silently average a shrinking sample.
+        A team's k-th unplayed game averages its last (window - k + 1) played
+        games, so week by week the "form" decays toward a single game and then
+        sticks there. Measured on margin_roll8 across 32 teams before this
+        was corrected: mean drift 1.4 points at the next game, 2.5 at the one
+        after, 11.1 by the eighth, against the value the team actually
+        carries out of its last completed game. That reaches LightGBM, which
+        takes every *_roll8_diff (modeling.gbm_feature_columns); ridge reads
+        only the _ewm columns and was unaffected by this second failure.
 
-    Forward-fills within team (the frame is sorted by team, season, week) and
-    applies the filled value ONLY where margin is null, i.e. genuinely
-    unplayed, so no played row -- including a played game with a pbp data
-    gap -- can change, and the walk-forward backtest stays byte-identical.
-    A team's first unplayed game already holds the right value (its form
-    after the last completed game); the later ones now inherit it.
+    Both are invisible in the backtest, where every game has been played.
+    compute_qb_form's carry-forward already handles the same failure mode for
+    the QB features.
+
+    The value to carry is the one at the team's FIRST unplayed game: that row
+    is the only one whose window is entirely completed games, so it holds the
+    team's true current form. It is sourced from there, forward-filled within
+    team (the frame is sorted by team, season, week at the call site), and
+    written ONLY where margin is null. So no played row can change -- not even
+    a played game with a pbp data gap, which stays exactly as the baseline
+    computed it -- and the walk-forward backtest stays byte-identical.
+
+    A team with no completed game at all to source from (a brand-new
+    franchise, or a wholly unplayed season pulled in before any game) keeps
+    whatever _rolling_exprs produced, i.e. null, and is median-imputed
+    downstream exactly as before.
     """
     cols = [c for c in _form_cols(stat_cols) if c in long.columns]
     unplayed = pl.col("margin").is_null()
+    first_unplayed = unplayed & pl.col("margin").shift(1).over("team").is_not_null()
     return long.with_columns(
-        [pl.when(unplayed).then(pl.col(c).forward_fill().over("team")).otherwise(pl.col(c)).alias(c) for c in cols]
+        [
+            pl.when(unplayed)
+            .then(pl.when(first_unplayed).then(pl.col(c)).forward_fill().over("team"))
+            .otherwise(pl.col(c))
+            .alias(c)
+            for c in cols
+        ]
     )
 
 
