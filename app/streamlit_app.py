@@ -382,6 +382,189 @@ def current_elo(elo_hist: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+# Per-team form columns worth surfacing in the drill-down, in display order:
+# (modeling-table stem, label, number format, whether LOWER is better).
+# Every one of these is an actual model input or a diagnostic sitting beside
+# them, not a derived statistic invented for the UI.
+TEAM_FORM_FIELDS = [
+    ("off_epa_play_ewm", "Offense EPA/play", "{:+.3f}", False),
+    ("def_epa_allowed_play_ewm", "Defense EPA/play allowed", "{:+.3f}", True),
+    ("off_success_rate_ewm", "Offense success rate", "{:.1%}", False),
+    ("off_pass_epa_ewm", "Pass EPA/play", "{:+.3f}", False),
+    ("off_rush_epa_ewm", "Rush EPA/play", "{:+.3f}", False),
+    ("qb_epa_per_att_ewm", "QB EPA/attempt", "{:+.3f}", False),
+    ("off_plays_ewm", "Plays per game", "{:.1f}", False),
+    ("pen_yards_ewm", "Penalty yards/game", "{:.1f}", True),
+    ("pen_presnap_ewm", "Pre-snap penalties/game", "{:.2f}", True),
+]
+
+# Injury groups. These are NOT model inputs -- measured and rejected (see
+# config.py) -- but they are the most legible thing on the page for "who is
+# hurt and where", which is exactly what the model reduces to one number.
+TEAM_INJURY_FIELDS = [
+    ("inj_ol", "O-line"), ("inj_dl", "D-line"), ("inj_lb", "Linebackers"),
+    ("inj_db", "Secondary"), ("inj_rec", "Receivers"), ("inj_rb", "Backs"),
+    ("qb_injury_score", "Quarterback"),
+]
+
+
+@st.cache_data
+def load_team_game_log() -> pl.DataFrame | None:
+    """One row per TEAM per game, from that team's own point of view.
+
+    The modeling table is one row per game with home_/away_ prefixed columns;
+    this unpivots it so a team can be followed down a column. Margin, spread
+    and the model's prediction are all flipped to the selected team's
+    perspective, so a positive number always means good for THIS team, which
+    is the only way a game log is readable.
+    """
+    path = config.PROCESSED_DIR / "modeling_table.parquet"
+    if not path.exists():
+        return None
+    mt = pl.read_parquet(path)
+
+    stems = [f for f, _, _, _ in TEAM_FORM_FIELDS] + [f for f, _ in TEAM_INJURY_FIELDS]
+    stems += ["elo_pre", "injury_score", "rest", "games_played_season"]
+    stems = [f for f in stems if f"home_{f}" in mt.columns and f"away_{f}" in mt.columns]
+
+    base = ["game_id", "season", "week", "gameday", "game_type", "spread_line", "total_line"]
+
+    def side(is_home: bool) -> pl.DataFrame:
+        me, them = ("home", "away") if is_home else ("away", "home")
+        sign = 1 if is_home else -1
+        cols = [pl.col(c) for c in base] + [
+            pl.col(f"{me}_team").alias("team"),
+            pl.col(f"{them}_team").alias("opponent"),
+            pl.lit(is_home).alias("is_home"),
+            (pl.col("home_margin") * sign).alias("margin"),
+            (pl.col("spread_line") * sign).alias("spread_for_team"),
+            pl.col(f"{me}_score").alias("points_for"),
+            pl.col(f"{them}_score").alias("points_against"),
+            pl.col(f"{them}_elo_pre").alias("opp_elo_pre"),
+        ]
+        cols += [pl.col(f"{me}_{f}").alias(f) for f in stems]
+        return mt.select(cols).with_columns(pl.lit(sign).alias("_sign"))
+
+    long = pl.concat([side(True), side(False)]).sort(["team", "season", "week"])
+
+    # Elo AFTER a game is the rating the team carries into its next one. The
+    # last played game gets it from the next scheduled game, which is exactly
+    # what compute_elo_ratings records there.
+    long = long.with_columns(pl.col("elo_pre").shift(-1).over("team").alias("elo_post"))
+    long = long.with_columns((pl.col("elo_post") - pl.col("elo_pre")).alias("elo_change"))
+
+    # Cover, from this team's side. A push is neither.
+    long = long.with_columns(
+        pl.when(pl.col("margin").is_null())
+        .then(None)
+        .when(pl.col("margin") > pl.col("spread_for_team"))
+        .then(pl.lit("Cover"))
+        .when(pl.col("margin") < pl.col("spread_for_team"))
+        .then(pl.lit("No cover"))
+        .otherwise(pl.lit("Push"))
+        .alias("ats_result"),
+        pl.when(pl.col("margin").is_null()).then(None)
+        .when(pl.col("margin") > 0).then(pl.lit("W"))
+        .when(pl.col("margin") < 0).then(pl.lit("L"))
+        .otherwise(pl.lit("T")).alias("result"),
+    )
+    return long
+
+
+@st.cache_data
+def team_log_with_predictions(model: str) -> pl.DataFrame | None:
+    """The team game log plus this model's predicted margin and its error,
+    both flipped to the team's own perspective."""
+    log = load_team_game_log()
+    preds = load_predictions(model)
+    if log is None or preds is None:
+        return log
+    p = preds.select(["game_id", "predicted_margin"])
+    out = log.join(p, on="game_id", how="left").with_columns(
+        (pl.col("predicted_margin") * pl.col("_sign")).alias("model_margin")
+    )
+    return out.with_columns(
+        (pl.col("model_margin") - pl.col("margin")).alias("model_error"),
+        (pl.col("model_margin") - pl.col("spread_for_team")).alias("model_vs_line"),
+    )
+
+
+@st.cache_data
+def team_bias_table(model: str) -> pl.DataFrame | None:
+    """Per team: how much the MODEL over- or under-rates it, next to how much
+    the MARKET does, and the difference.
+
+    The tab has always claimed this finding in prose -- perennially strong
+    franchises underrated, weak ones overrated -- without ever showing the
+    number. Positive means the source predicted that team to do better than it
+    actually did, i.e. overrated it. The `excess` column is the only one that
+    is really about the MODEL: a team both the model and the market read the
+    same way is not a model problem.
+    """
+    log = team_log_with_predictions(model)
+    if log is None or "model_margin" not in log.columns:
+        return None
+    graded = log.filter(pl.col("margin").is_not_null() & pl.col("model_margin").is_not_null())
+    if graded.height == 0:
+        return None
+    return (
+        graded.with_columns(
+            (pl.col("model_margin") - pl.col("margin")).alias("_model_bias"),
+            (pl.col("spread_for_team") - pl.col("margin")).alias("_market_bias"),
+        )
+        .group_by("team")
+        .agg(
+            pl.len().alias("games"),
+            pl.col("_model_bias").mean().alias("model_bias"),
+            pl.col("_market_bias").mean().alias("market_bias"),
+        )
+        .with_columns((pl.col("model_bias") - pl.col("market_bias")).alias("excess"))
+        .sort("excess")
+    )
+
+
+def diverging_team_bars(
+    pdf: pd.DataFrame, value_col: str, title: str, xaxis_title: str,
+    pos_label: str, neg_label: str, hovertemplate: str, customdata: list[str] | None = None,
+) -> go.Figure:
+    """Horizontal diverging bars across teams, one bar per team, colored by
+    SIGN only.
+
+    Diverging because the quantity has a real zero with opposite meanings on
+    each side; blue and orange are used as the two poles because they read as
+    cool/warm opposites, and the neutral midpoint is the zero rule itself.
+    Deliberately NOT a magnitude ramp: shading each bar darker-where-bigger
+    would double-encode length as hue and burn the only free channel on
+    information the bar already carries.
+    """
+    fig = go.Figure()
+    for label, color, mask in [
+        (neg_label, BLUE, pdf[value_col] < 0),
+        (pos_label, ORANGE, pdf[value_col] >= 0),
+    ]:
+        if not mask.any():
+            continue
+        fig.add_bar(
+            y=pdf.loc[mask, "team"], x=pdf.loc[mask, value_col],
+            name=label, marker_color=color, orientation="h",
+            customdata=pdf.loc[mask, customdata] if customdata else None,
+            hovertemplate=hovertemplate,
+        )
+    fig.add_vline(x=0, line_width=1, line_color=INK_SECONDARY)
+    # CHART_LAYOUT's 40px top margin is not enough once a horizontal legend
+    # sits above the plotting area: the legend row lands on top of the title.
+    layout = {**CHART_LAYOUT, "margin": dict(l=10, r=10, t=96, b=10)}
+    fig.update_layout(
+        title=dict(text=title, y=0.985, yanchor="top"),
+        xaxis_title=xaxis_title, showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.015, x=0),
+        height=max(380, 20 * len(pdf) + 180), bargap=0.25, **layout,
+    )
+    fig.update_xaxes(gridcolor=GRID, linecolor=GRID, zeroline=False)
+    fig.update_yaxes(gridcolor=GRID, linecolor=GRID)
+    return fig
+
+
 def bucket_axis(df: pl.DataFrame, col: str, order: list[str], labels: dict[str, str]) -> pl.DataFrame:
     df = df.filter(pl.col(col).is_in(order))
     df = df.with_columns(pl.col(col).cast(pl.Enum(order)))
@@ -1193,11 +1376,14 @@ with tab_explorer:
 
 with tab_ratings:
     st.caption(
-        "The Elo power rating both models use, entering each game. Diagnosed earlier from residual "
-        "bias: this rating regresses 33% back to the mean every offseason, which is a reasonable "
-        "prior for an average team but erases real, persistent organizational quality faster than the "
-        "market seems to -- perennially strong franchises are systematically underrated here, and "
-        "perennially weak ones overrated. Compare a couple of teams below to see it directly."
+        "The Elo power rating every model uses, entering each game. It regresses 33% back to the "
+        "mean each offseason, a reasonable prior for an average team but one that erases persistent "
+        "organizational quality faster than the market does -- the long-standing complaint about "
+        "this rating was that it underrates perennially strong franchises and overrates weak ones. "
+        "The team-bias section below is that complaint as a number, and it is also where market "
+        "anchoring shows up: mean absolute excess bias across the 32 teams is 0.44 points per game "
+        "for the ridge baseline against 0.12 for the anchored ensemble. Switch models in the "
+        "sidebar to compare."
     )
     elo_hist = load_elo_history()
     if elo_hist is None:
@@ -1244,6 +1430,203 @@ with tab_ratings:
                 "does not move a rating, so this table only advances as results come in."
             )
         st.dataframe(latest.to_pandas(), width="stretch", hide_index=True)
+
+        # --- Does the model rate any team differently from the market? -------
+        st.divider()
+        st.subheader("Where this model disagrees with the market, by team")
+        bias = team_bias_table(model)
+        if bias is None:
+            st.info("No graded predictions for this model yet.")
+        else:
+            st.caption(
+                "The caption at the top of this tab has always asserted that the rating misjudges "
+                "certain franchises; this is that claim as a number. Positive means the source "
+                "expected that team to do better than it actually did, i.e. overrated it. Only the "
+                "third column is about the MODEL: a team the market reads the same way is not a "
+                "model problem, it is a hard team to rate. Computed over every graded game for "
+                f"{MODEL_LABELS[model]}, from each team's own perspective."
+            )
+            bpdf = bias.to_pandas()
+            mean_abs = bpdf["excess"].abs().mean()
+            worst = bpdf.iloc[bpdf["excess"].abs().argmax()]
+            c1, c2 = st.columns(2)
+            c1.metric(
+                "Mean absolute excess bias", f"{mean_abs:.2f} pts",
+                help="Averaged across all 32 teams. How far the model's read of a typical team "
+                "sits from the market's, in points per game.",
+            )
+            c2.metric(
+                "Largest disagreement", f"{worst['team']}  {worst['excess']:+.2f} pts",
+                help="The team this model rates most differently from the market.",
+            )
+            st.plotly_chart(
+                diverging_team_bars(
+                    bpdf, "excess",
+                    "Model bias minus market bias (points per game)",
+                    "Excess bias vs the market (points)",
+                    pos_label="Model is higher on this team",
+                    neg_label="Model is lower on this team",
+                    customdata=["model_bias", "market_bias", "games"],
+                    hovertemplate=(
+                        "%{y}<br>Excess vs market: %{x:+.2f} pts"
+                        "<br>Model bias: %{customdata[0]:+.2f}"
+                        "<br>Market bias: %{customdata[1]:+.2f}"
+                        "<br>Games: %{customdata[2]}<extra></extra>"
+                    ),
+                ),
+                width="stretch",
+            )
+
+        # --- One team, in depth ---------------------------------------------
+        st.divider()
+        st.subheader("Team detail")
+        log = team_log_with_predictions(model)
+        if log is None:
+            st.info("No modeling table found. Run `python main.py` first.")
+        else:
+            all_teams = sorted(log["team"].unique().to_list())
+            rank_lookup = {r["team"]: i + 1 for i, r in enumerate(latest.to_dicts())}
+            c1, c2 = st.columns([2, 3])
+            team = c1.selectbox("Team", all_teams, index=all_teams.index(default_teams[0]) if default_teams else 0)
+            seasons_avail = sorted(log["season"].unique().to_list(), reverse=True)
+            season_pick = c2.selectbox("Season", seasons_avail, index=0)
+
+            tl = log.filter(pl.col("team") == team).sort(["season", "week"])
+            tl_season = tl.filter(pl.col("season") == season_pick)
+            played = tl_season.filter(pl.col("margin").is_not_null())
+            upcoming = tl_season.filter(pl.col("margin").is_null())
+
+            row = latest.filter(pl.col("team") == team)
+            cur_elo = float(row["elo"][0]) if row.height else float("nan")
+            wins = int((played["result"] == "W").sum())
+            losses = int((played["result"] == "L").sum())
+            covers = int((played["ats_result"] == "Cover").sum())
+            no_covers = int((played["ats_result"] == "No cover").sum())
+            season_elo_change = float(played["elo_change"].sum()) if played.height else 0.0
+            sos_played = float(played["opp_elo_pre"].mean()) if played.height else float("nan")
+            sos_left = float(upcoming["opp_elo_pre"].mean()) if upcoming.height else float("nan")
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric(
+                "Current Elo", f"{cur_elo:.0f}",
+                delta=f"{season_elo_change:+.0f} in {season_pick}" if played.height else None,
+                help=f"League rank {rank_lookup.get(team, '--')} of {latest.height}. "
+                f"{config.ELO_INITIAL:.0f} is average; ratings regress "
+                f"{config.SEASON_REGRESSION_TO_MEAN:.0%} toward it each offseason.",
+            )
+            m2.metric(f"{season_pick} record", f"{wins}-{losses}",
+                      help="Regular season and playoffs, completed games only.")
+            m3.metric("Against the spread", f"{covers}-{no_covers}",
+                      help="How often this team beat the closing line. Pushes excluded.")
+            m4.metric(
+                "Opponent Elo faced", f"{sos_played:.0f}" if played.height else "--",
+                delta=f"{sos_left - sos_played:+.0f} remaining" if upcoming.height and played.height else None,
+                delta_color="inverse",
+                help="Average rating of opponents played, and how much harder or easier what is "
+                "left looks. A positive delta means a tougher run-in.",
+            )
+
+            # Rating trajectory for this one team. Single series, so no legend
+            # box -- the title names it (see the accessibility rule).
+            tpdf = tl.filter(pl.col("elo_pre").is_not_null()).to_pandas()
+            fig = go.Figure()
+            fig.add_scatter(
+                x=tpdf["gameday"], y=tpdf["elo_pre"], mode="lines",
+                line=dict(color=BLUE, width=2), name=team,
+                customdata=tpdf[["season", "week", "opponent", "result"]],
+                hovertemplate=(
+                    "%{x|%Y-%m-%d}<br>Elo %{y:.0f}"
+                    "<br>%{customdata[0]} wk %{customdata[1]} vs %{customdata[2]}"
+                    "<br>Result: %{customdata[3]}<extra></extra>"
+                ),
+            )
+            fig.add_hline(y=config.ELO_INITIAL, line_width=1, line_color=GRID)
+            fig.update_layout(
+                title=f"{team} Elo rating entering each game, all seasons",
+                yaxis_title="Elo (pre-game)", xaxis_title="Date",
+                showlegend=False, height=320, **CHART_LAYOUT,
+            )
+            fig.update_xaxes(gridcolor=GRID, linecolor=GRID)
+            fig.update_yaxes(gridcolor=GRID, linecolor=GRID)
+            st.plotly_chart(fig, width="stretch")
+
+            # Form: the model's own inputs, with league context. Stat tiles
+            # rather than a chart -- each of these is one number, and a chart
+            # of one number per metric is the classic wrong form.
+            st.markdown("**Form entering the next game, against the rest of the league**")
+            st.caption(
+                "These are the actual model inputs, recency-weighted over prior games and carried "
+                "forward from the last completed game. The percentile is against every team's "
+                f"current value in {season_pick}. Penalty counts are shown because they were "
+                "measured this session and rejected as model features (see Methodology) -- they are "
+                "here to look at, not because the model bets on them."
+            )
+            latest_row = tl_season.sort(["season", "week"]).tail(1)
+            league_now = (
+                log.filter(pl.col("season") == season_pick)
+                .sort(["team", "season", "week"])
+                .group_by("team", maintain_order=False)
+                .agg([pl.col(f).last().alias(f) for f, _, _, _ in TEAM_FORM_FIELDS if f in log.columns])
+            )
+            if latest_row.height:
+                fields = [f for f in TEAM_FORM_FIELDS if f[0] in latest_row.columns]
+                for chunk_start in range(0, len(fields), 3):
+                    cols = st.columns(3)
+                    for col, (stem, label, fmt, lower_better) in zip(cols, fields[chunk_start:chunk_start + 3]):
+                        val = latest_row[stem][0]
+                        if val is None:
+                            col.metric(label, "--")
+                            continue
+                        vals = league_now[stem].drop_nulls().to_numpy()
+                        pct = float((vals < val).mean() * 100) if len(vals) else float("nan")
+                        if lower_better:
+                            pct = 100 - pct
+                        col.metric(
+                            label, fmt.format(val),
+                            help=f"{pct:.0f}th percentile in the league "
+                            f"({'lower is better' if lower_better else 'higher is better'}).",
+                        )
+
+            # Injuries by unit -- the decomposition, which is the legible part
+            # even though the model was measured not to benefit from it.
+            inj_fields = [(f, lbl) for f, lbl in TEAM_INJURY_FIELDS if f in tl_season.columns]
+            if latest_row.height and inj_fields:
+                st.markdown("**Injury weight by unit, entering the next game**")
+                st.caption(
+                    "Each player on the official report counted as severity (out 1.0, doubtful 0.5, "
+                    "questionable 0.25) times their own recent snap share, so a starter weighs far "
+                    "more than a backup. Next week's report does not exist yet, so a zero there "
+                    "means 'not published', not 'nobody hurt'."
+                )
+                cols = st.columns(len(inj_fields))
+                for col, (stem, lbl) in zip(cols, inj_fields):
+                    v = latest_row[stem][0]
+                    col.metric(lbl, f"{float(v):.2f}" if v is not None else "--")
+
+            st.markdown(f"**{season_pick} game log**")
+            disp = tl_season.select(
+                pl.col("week").alias("Wk"),
+                pl.when(pl.col("is_home")).then(pl.lit("vs")).otherwise(pl.lit("@")).alias(""),
+                pl.col("opponent").alias("Opp"),
+                pl.col("opp_elo_pre").round(0).alias("Opp Elo"),
+                pl.col("points_for").alias("PF"),
+                pl.col("points_against").alias("PA"),
+                pl.col("margin").alias("Margin"),
+                pl.col("spread_for_team").alias("Line"),
+                pl.col("ats_result").alias("ATS"),
+                pl.col("model_margin").round(1).alias("Model"),
+                pl.col("model_error").round(1).alias("Model err"),
+                pl.col("elo_pre").round(0).alias("Elo before"),
+                pl.col("elo_change").round(1).alias("Elo move"),
+                pl.col("rest").alias("Rest"),
+            ).sort("Wk")
+            st.dataframe(disp.to_pandas(), width="stretch", hide_index=True)
+            st.caption(
+                "Margin, line and model are all from this team's point of view, so positive is "
+                "always good for them. \"Model err\" is the model's predicted margin minus what "
+                "actually happened: positive means it expected more than it got. \"Elo move\" is "
+                "what that result did to the rating. Rows with blanks have not been played."
+            )
 
 # --- Bet sizing ----------------------------------------------------------------
 
