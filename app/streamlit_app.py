@@ -102,18 +102,48 @@ def load_contributions(model: str) -> pl.DataFrame | None:
     return pl.read_parquet(path)
 
 
+def pipeline_threshold(pdf: pd.DataFrame, market: str):
+    """The per-game bar the pipeline ACTUALLY placed its bets at, read back
+    from the stored `ats_threshold_used` / `ml_threshold_used` column, so the
+    dashboard's default view is the validated bet book rather than one fixed
+    bar applied to every game.
+
+    Before this existed every tab regraded at a single scalar defaulting to
+    config.ATS_EDGE_THRESHOLD_POINTS, while the pipeline derives a different
+    bar per game from the walk-forward shrinkage slope and the odds on offer
+    (backtesting.adaptive_ats_threshold). The two books differed in size and
+    ROI, and the gap grows roughly 4x under a market-anchored ensemble, whose
+    edges are a quarter the size of the 3.5-point default. Falls back to the
+    fixed config default wherever the column is missing (older parquets, or a
+    market the pipeline still runs at a fixed bar) or null.
+    """
+    col = "ats_threshold_used" if market == "ats" else "ml_threshold_used"
+    default = config.ATS_EDGE_THRESHOLD_POINTS if market == "ats" else config.ML_EDGE_THRESHOLD_PROB
+    if col not in pdf.columns:
+        return float(default)
+    return pdf[col].astype(float).fillna(float(default)).to_numpy()
+
+
+def effective_threshold(pdf: pd.DataFrame, market: str, threshold: float | None):
+    """`None` means "use the pipeline's own per-game bar"; a number is the
+    sidebar's manual override, applied to every game."""
+    return pipeline_threshold(pdf, market) if threshold is None else threshold
+
+
 @st.cache_data
-def regraded_bets(model: str, market: str, threshold: float) -> pl.DataFrame | None:
-    """Re-decide bet_side (and re-grade profit/staked) at a user-chosen
-    threshold, reusing the exact regrade_ats/regrade_ml logic main.py uses at
-    the pipeline's default threshold. ats_edge/ml_edge/model probabilities are
-    already computed for every game regardless of threshold, so this is a
-    cheap re-grade, not a re-run of the model."""
+def regraded_bets(model: str, market: str, threshold: float | None) -> pl.DataFrame | None:
+    """Re-decide bet_side (and re-grade profit/staked) at the sidebar's
+    threshold -- the pipeline's own per-game bar when `threshold` is None --
+    reusing the exact regrade_ats/regrade_ml logic main.py uses.
+    ats_edge/ml_edge/model probabilities are already computed for every game
+    regardless of threshold, so this is a cheap re-grade, not a re-run of the
+    model."""
     raw = load_bets(model, market)
     if raw is None:
         return None
     pdf = raw.to_pandas()
-    pdf = backtesting.regrade_ats(pdf, threshold) if market == "ats" else backtesting.regrade_ml(pdf, threshold)
+    thr = effective_threshold(pdf, market, threshold)
+    pdf = backtesting.regrade_ats(pdf, thr) if market == "ats" else backtesting.regrade_ml(pdf, thr)
     return evaluation.add_bet_context(pl.from_pandas(pdf))
 
 
@@ -538,32 +568,58 @@ with st.sidebar:
     market = st.radio("Market", list(MARKET_LABELS), format_func=lambda m: MARKET_LABELS[m])
 
     st.subheader("Bet-selection threshold")
+    threshold_mode = st.radio(
+        "Threshold source",
+        ["Pipeline (per game, adaptive)", "Manual (one bar for every game)"],
+        help="The pipeline does not bet at one fixed bar: each game's bar is derived walk-forward from "
+        "the shrinkage slope and the odds on offer (backtesting.adaptive_ats_threshold) and stored with "
+        "the bet. 'Pipeline' shows exactly that validated book. 'Manual' applies the slider to every "
+        "game instead -- useful for what-ifs, but it is a different book from the one the README's "
+        "backtest numbers describe.",
+    )
+    manual = threshold_mode.startswith("Manual")
     if market == "ats":
         default_threshold = config.ATS_EDGE_THRESHOLD_POINTS
-        threshold = st.slider(
+        slider_value = st.slider(
             "Min. |model spread - market spread| to bet (points)",
-            0.0, 10.0, float(default_threshold), 0.25,
+            0.0, 10.0, float(default_threshold), 0.25, disabled=not manual,
             help="Every game already has its edge computed; this just redraws which "
             "games clear the bar to bet, live. Lower = more bets, noisier ROI. "
-            f"Pipeline default: {default_threshold} pts.",
+            f"Fixed fallback the pipeline uses before it has enough history: {default_threshold} pts.",
         )
     else:
         default_threshold = config.ML_EDGE_THRESHOLD_PROB
-        threshold = st.slider(
+        slider_value = st.slider(
             "Min. |model prob - de-vigged market prob| to bet",
-            0.0, 0.20, float(default_threshold), 0.005, format="%.3f",
+            0.0, 0.20, float(default_threshold), 0.005, format="%.3f", disabled=not manual,
             help="Every game already has its edge computed; this just redraws which "
             "games clear the bar to bet, live. Lower = more bets, noisier ROI. "
-            f"Pipeline default: {default_threshold:.3f}.",
+            f"Fixed bar the pipeline uses for this market: {default_threshold:.3f}.",
         )
-    if abs(threshold - default_threshold) > 1e-9:
-        st.caption(f"Adjusted from pipeline default ({default_threshold:.3g}).")
+    threshold = float(slider_value) if manual else None
+    threshold_label = (
+        "the pipeline's per-game threshold" if threshold is None else f"a manual {threshold:.3g} threshold"
+    )
+    if manual and abs(threshold - default_threshold) > 1e-9:
+        st.caption(f"Manual bar differs from the pipeline's fixed fallback ({default_threshold:.3g}).")
 
     if st.button("Reload data from disk"):
         st.cache_data.clear()
 
 predictions = load_predictions(model)
 bets_ctx = regraded_bets(model, market, threshold)
+
+if threshold is None and bets_ctx is not None:
+    _thr_col = "ats_threshold_used" if market == "ats" else "ml_threshold_used"
+    if _thr_col in bets_ctx.columns and bets_ctx[_thr_col].null_count() < bets_ctx.height:
+        _thr = bets_ctx[_thr_col].drop_nulls()
+        st.sidebar.caption(
+            f"Pipeline threshold in use: per game, median {_thr.median():.3g}, "
+            f"range {_thr.min():.3g} to {_thr.max():.3g}."
+        )
+    else:
+        _fixed = config.ATS_EDGE_THRESHOLD_POINTS if market == "ats" else config.ML_EDGE_THRESHOLD_PROB
+        st.sidebar.caption(f"Pipeline threshold in use: fixed {_fixed:.3g} (this market carries no per-game bar).")
 
 if bets_ctx is None or predictions is None:
     st.error(
@@ -617,10 +673,11 @@ with tab_upcoming:
         else:
             edge_col, prob_col, home_odds_col, away_odds_col = "ml_edge", "model_home_prob", "home_moneyline", "away_moneyline"
 
-        # Same selection rule as backtesting.py, applied live at the sidebar's
-        # threshold slider -- routed through the shared helper so the moneyline
-        # underdog-only restriction can't go missing here.
-        pdf["bet_side"] = backtesting.decide_bet_side(pdf, market, threshold)
+        # Same selection rule as backtesting.py, at the sidebar's threshold --
+        # by default the per-game bar the pipeline stored on this board
+        # (ats_threshold_used / ml_threshold_used) -- routed through the shared
+        # helper so the moneyline underdog-only restriction can't go missing.
+        pdf["bet_side"] = backtesting.decide_bet_side(pdf, market, effective_threshold(pdf, market, threshold))
 
         is_home = pdf["bet_side"] == "home"
         prob_for_side = np.where(is_home, pdf[prob_col], 1.0 - pdf[prob_col])
@@ -656,7 +713,7 @@ with tab_upcoming:
         n_bets = int((pdf["bet_side"] != "none").sum())
         st.caption(
             f"{len(pdf)} game(s) in week {week_pick}, {MODEL_LABELS[model]} / {MARKET_LABELS[market]}. "
-            f"{n_bets} clear the current {threshold:.3g} threshold."
+            f"{n_bets} clear {threshold_label}."
         )
 
         display_cols = {
@@ -709,7 +766,7 @@ with tab_track_record:
             home_odds_col = "home_spread_odds" if market == "ats" else "home_moneyline"
             away_odds_col = "away_spread_odds" if market == "ats" else "away_moneyline"
 
-            pdf["bet_side"] = backtesting.decide_bet_side(pdf, market, threshold)
+            pdf["bet_side"] = backtesting.decide_bet_side(pdf, market, effective_threshold(pdf, market, threshold))
             if market == "ats":
                 home_right = pdf["home_margin"] > pdf["spread_line"]
             else:
@@ -760,7 +817,7 @@ with tab_track_record:
                 width="stretch", hide_index=True,
             )
             st.caption(
-                f"{MODEL_LABELS[model]} / {MARKET_LABELS[market]}, graded at the current {threshold:.3g} threshold. "
+                f"{MODEL_LABELS[model]} / {MARKET_LABELS[market]}, graded at {threshold_label}. "
                 "This can change if the sidebar threshold is adjusted -- bet_side is re-decided live from the "
                 "logged edge, same as every other tab, but the underlying prediction/edge itself is exactly what "
                 "was logged before that game, not recomputed."
