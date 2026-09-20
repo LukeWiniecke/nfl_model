@@ -202,12 +202,18 @@ def main():
     injury_features = feature_engineering.compute_injury_features(raw["injuries"], player_snap_share)
     qb_injury_features = feature_engineering.compute_qb_injury_features(raw["injuries"], player_snap_share)
     referee_features = feature_engineering.compute_referee_features(raw["officials"], games)
+    # Per-unit decomposition of the same injury score (inj_ol/dl/lb/db/rec/rb).
+    # Creates *_diff columns; no model uses them unless named in a feature
+    # list, and they carry no _ewm_diff/_roll8_diff suffix so LightGBM's
+    # auto-detection cannot pick them up either. Taking these AND injury_diff
+    # would double-count -- they are a decomposition of it, not new data.
+    unit_injury_features = feature_engineering.compute_unit_injury_features(raw["injuries"], player_snap_share)
 
     logger.info("Assembling game-level modeling table...")
     modeling_table = feature_engineering.build_modeling_table(
         games, team_long_form, ratings, spreadspoke_ctx=spreadspoke_ctx,
         injury_features=injury_features, qb_injury_features=qb_injury_features,
-        referee_features=referee_features,
+        referee_features=referee_features, unit_injury_features=unit_injury_features,
     )
     modeling_table.write_parquet(config.PROCESSED_DIR / "modeling_table.parquet")
     logger.info(f"Modeling table: {modeling_table.shape}")

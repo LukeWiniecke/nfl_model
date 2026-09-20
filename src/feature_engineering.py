@@ -624,6 +624,58 @@ def compute_qb_injury_features(
     )
 
 
+# Position groups for routing an injury to the unit it actually degrades.
+# QB is deliberately absent: it already has its own score
+# (compute_qb_injury_features) and its own form features.
+# Specialists (K, P, LS, KR) are absent too -- 455 of 40,951 usable rows, and
+# a kicker's absence is not a unit-strength question.
+INJURY_UNIT_GROUPS = {
+    "inj_ol": ["T", "G", "C"],
+    "inj_dl": ["DE", "DT"],
+    "inj_lb": ["LB"],
+    "inj_db": ["CB", "S"],
+    "inj_rec": ["WR", "TE"],
+    "inj_rb": ["RB", "FB"],
+}
+
+
+def compute_unit_injury_features(
+    injuries: pl.DataFrame, player_snap_share: pl.DataFrame | None = None
+) -> pl.DataFrame:
+    """One row per (season, week, team): the same severity x snap-share
+    injury weight as compute_injury_features, but split across six position
+    groups instead of collapsed into one number.
+
+    The motivation is that `team_injury_score` is a scalar, so a team missing
+    its starting left tackle and a team missing its slot corner produce an
+    identical value when their snap shares match, even though those degrade
+    completely different things. Splitting lets the model learn that, say, an
+    offensive-line injury costs more than a linebacker one -- if it does.
+
+    Unlike the unit-STRENGTH data from Pro Football Reference (pressure rates,
+    coverage), which only starts in 2018, the injury report carries `position`
+    back to 2010, so this covers every season the model trains on and is fully
+    available for an upcoming game. That is the whole reason to route injuries
+    by position rather than by a measured unit rating.
+
+    Sums to team_injury_score up to the specialists and any position outside
+    the groups above, so these are a decomposition of the existing feature,
+    not new information. Any model should take the six OR the scalar, never
+    both.
+    """
+    frames = []
+    for col, positions in INJURY_UNIT_GROUPS.items():
+        frames.append(
+            _severity_weighted_injury_score(
+                injuries, player_snap_share, pl.col("position").is_in(positions), col
+            )
+        )
+    out = frames[0]
+    for f in frames[1:]:
+        out = out.join(f, on=["season", "week", "team"], how="full", coalesce=True)
+    return out.with_columns([pl.col(c).fill_null(0.0) for c in INJURY_UNIT_GROUPS])
+
+
 def compute_referee_features(officials: pl.DataFrame, games: pl.DataFrame) -> pl.DataFrame:
     """One row per game_id: a leakage-safe rolling EWM of each game's
     RESIDUAL against the market's own total_line (actual total points
@@ -711,6 +763,7 @@ def add_game_context_features(
     injury_features: pl.DataFrame | None = None,
     qb_injury_features: pl.DataFrame | None = None,
     referee_features: pl.DataFrame | None = None,
+    unit_injury_features: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Neutral-site, weather, and (if available) prime-time/surface features,
     used directly (not as home/away diffs, since these affect both teams in
@@ -774,6 +827,30 @@ def add_game_context_features(
         df = df.join(away_inj, on=["season", "week", "away_team"], how="left")
         df = df.with_columns((pl.col("home_injury_score") - pl.col("away_injury_score")).alias("injury_diff"))
 
+    if unit_injury_features is not None:
+        # Per-unit decomposition of the same score. A team with no reported
+        # injury in a group has no row rather than a 0, and a missing group
+        # means "nobody hurt there", so both sides are filled with 0.0 before
+        # subtracting -- the same reasoning as qb_injury_diff below, and for
+        # the same reason: left null, one side's absence would null the diff
+        # for the majority of games.
+        unit_cols = [c for c in INJURY_UNIT_GROUPS if c in unit_injury_features.columns]
+        home_u = unit_injury_features.rename(
+            {"team": "home_team", **{c: f"home_{c}" for c in unit_cols}}
+        )
+        away_u = unit_injury_features.rename(
+            {"team": "away_team", **{c: f"away_{c}" for c in unit_cols}}
+        )
+        df = df.join(home_u, on=["season", "week", "home_team"], how="left")
+        df = df.join(away_u, on=["season", "week", "away_team"], how="left")
+        df = df.with_columns(
+            [pl.col(f"home_{c}").fill_null(0.0) for c in unit_cols]
+            + [pl.col(f"away_{c}").fill_null(0.0) for c in unit_cols]
+        )
+        df = df.with_columns(
+            [(pl.col(f"home_{c}") - pl.col(f"away_{c}")).alias(f"{c}_diff") for c in unit_cols]
+        )
+
     if qb_injury_features is not None:
         home_qb_inj = qb_injury_features.rename({"team": "home_team", "qb_injury_score": "home_qb_injury_score"})
         away_qb_inj = qb_injury_features.rename({"team": "away_team", "qb_injury_score": "away_qb_injury_score"})
@@ -821,6 +898,7 @@ def build_modeling_table(
     injury_features: pl.DataFrame | None = None,
     qb_injury_features: pl.DataFrame | None = None,
     referee_features: pl.DataFrame | None = None,
+    unit_injury_features: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Wide game-level table: one row per game, home/away form features as
     *_diff columns (home - away) for the margin models, *_sum columns
@@ -846,7 +924,9 @@ def build_modeling_table(
     home_form = home_form.rename({c: f"home_{c}" for c in form_cols})
     away_form = away_form.rename({c: f"away_{c}" for c in form_cols})
 
-    df = add_game_context_features(games, spreadspoke_ctx, injury_features, qb_injury_features, referee_features)
+    df = add_game_context_features(
+        games, spreadspoke_ctx, injury_features, qb_injury_features, referee_features, unit_injury_features
+    )
     df = df.join(home_form.drop("team"), on="game_id", how="left")
     df = df.join(away_form.drop("team"), on="game_id", how="left")
 

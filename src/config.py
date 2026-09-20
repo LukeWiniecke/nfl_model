@@ -239,6 +239,70 @@ MARGIN_MODEL_FEATURES = [
 # +5.60% -> +1.71% at the same time. Worth knowing before someone retries
 # it -- it looks like the best idea in the run right up until the holdout
 # check, which is exactly why that check exists.
+#
+# --- 2026-09-20: penalties, unit strength, and unit-routed injuries ---
+#
+# Three ideas tried together, all NEGATIVE, all with the machinery kept in
+# place and inert (same convention as the referee features). Read this before
+# retrying any of them; each failed for a different and informative reason.
+#
+# 1. PENALTIES (feature_engineering.compute_game_penalty_splits ->
+#    pen_count/pen_yards/pen_presnap, rolled leakage-safe like every other
+#    raw stat). Required a real ingestion fix first: the pbp cache kept only
+#    the `penalty` flag, and since `posteam` is the offense while ~41% of
+#    penalties are on the defense, there was no way to tell who committed
+#    one. load_pbp now keeps penalty_team/yards/type.
+#    Pre-snap penalties were kept as their own stat deliberately -- false
+#    start, offside, illegal formation are discipline, not a by-product of
+#    aggressive play, so they are much less confounded with scheme and with
+#    facing a good opponent. That hypothesis held on the raw correlation:
+#    pre-snap is the strongest of the three against both the margin (-0.090)
+#    and the market residual (-0.023).
+#    It did not survive the harness. Four ridge variants, development ATS
+#    ROI: pre-snap alone +6.79%, all three +6.65%, yards alone +7.84%,
+#    pre-snap+yards +7.18%, against a +8.03% control -- every one worse, and
+#    the MAE gap moved by at most 0.0007 when the accuracy track needs 0.01.
+#    Most likely reason, and it is not "penalties do not matter": penalty
+#    yardage already moves field position, which already moves the EPA of
+#    every subsequent play, so off_epa_play and def_epa_allowed_play have
+#    been carrying this all along. The explicit version is redundant.
+#
+# 2. UNIT STRENGTH (OL / DL / secondary ratings from Pro Football Reference
+#    advanced stats, load_pfr_advstats, 2018+). NOT BUILT -- killed by a
+#    cheap screen before any Elo machinery was written, which is the part
+#    worth keeping. Eight leakage-safe unit diffs over 2,179 games. Against
+#    the MARKET RESIDUAL the individual correlations look genuinely
+#    promising: pressure share allowed -0.052, sacks allowed -0.048,
+#    completion pct allowed +0.050, all comparable to or LARGER than the
+#    ensemble's own raw edge (+0.039). But the joint 5-fold CV R^2 on the
+#    residual is NEGATIVE (-0.0087), while on the raw home margin it is
+#    +0.072. So the units really do predict the game -- the market has
+#    simply already priced them. Two of the signs also flip implausibly
+#    (allowing a higher completion percentage associating with COVERING),
+#    which is what a noise fit looks like.
+#    The lesson generalises past this feature: now that the ensemble is
+#    market-anchored, the bar for anything new is not "does it predict the
+#    margin" but "does it predict what the line missed", and those are very
+#    different questions. Screen against the residual first; it is minutes
+#    of work and it would have saved the whole Elo build here.
+#
+# 3. UNIT-ROUTED INJURIES (feature_engineering.compute_unit_injury_features
+#    -> inj_ol/dl/lb/db/rec/rb_diff). The motivation was real: injury_diff
+#    is a scalar, so a missing left tackle and a missing slot corner with
+#    equal snap share are indistinguishable. Unlike the PFR data this uses
+#    the injury report's own `position` and so covers 2010-2026 in full and
+#    is available live. The six scores sum back to injury_diff at corr 0.96
+#    -- a decomposition, not new information, so a model takes the six OR
+#    the scalar, never both.
+#    Four variants, development ATS ROI against a +8.03% control: replacing
+#    the scalar with all six +6.69%, with the best three +4.83%, scalar plus
+#    receivers +7.08%, scalar plus all six +5.58%. The best MAE-gap move was
+#    -0.0035 (still 3x short of the bar) and it cost 3.2pp of ROI and made
+#    the HOLDOUT MAE gap 0.0088 worse. Read as: there is not enough signal
+#    in the scalar to be worth splitting six ways at this sample size, and
+#    splitting it mostly buys variance. inj_ol_diff being the WEAKEST group
+#    against the residual (-0.003), against football intuition, is a further
+#    hint that what is being split is mostly noise.
 
 # Totals (over/under) model, phase 1: a small hand-picked feature set of
 # COMBINED (summed, not diffed -- see feature_engineering.TOTAL_SUM_PREFIXES)
