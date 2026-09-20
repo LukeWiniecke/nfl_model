@@ -909,6 +909,84 @@ SHRINKAGE_SLOPE_CAP = 1.0
 # README validated while the margin and probabilities stay market-anchored.
 ATS_SELECT_ON_UNANCHORED = True
 
+# How the MONEYLINE market is run under market anchoring.
+#
+#   "legacy_selection" -- REPORT the anchored, calibrated win probability;
+#                         SELECT on the legacy (pre-anchoring, pre-Platt)
+#                         probability, computed from the legacy inputs end to
+#                         end. The bet book is then the one the README
+#                         validated, bet for bet.
+#   "anchored"         -- select on whatever probability is reported. This is
+#                         r2-E9/r3b-E14's behaviour.
+#
+# THIS IS A DELIBERATE FREEZE OF THE MONEYLINE SELECTOR, NOT A CLAIM THAT THE
+# LEGACY PROBABILITY IS BETTER. It is the opposite claim: the anchored,
+# Platt-calibrated probability is measurably the better ESTIMATE (development
+# moneyline Brier 0.2117 against the market's 0.2123 -- the first time this
+# project's win probability has beaten the closing line -- and a calibration
+# slope of 0.995 against 0.775), which is why it is what gets reported. What
+# nobody has produced is a moneyline SELECTOR under anchoring that survives
+# scrutiny, and until someone does, the selector stays exactly as validated.
+#
+# Why the ATS argument does NOT carry over. For the SPREAD, anchoring cancels:
+# anchored = b_S * legacy + (1 - b_S) * line, so anchored - line =
+# b_S * (legacy - line), a single POSITIVE scalar per season. The ranking of
+# games by |edge| is therefore identical, and reporting one scale while
+# selecting on the other is information-free -- which is why
+# ATS_SELECT_ON_UNANCHORED reproduces the ATS book bet for bet (692
+# development / 96 holdout, 0 added, 0 dropped, profit_units identical).
+#
+# In the PROBABILITY domain it does not cancel. home_win_probability_t divides
+# the margin by a PER-GAME predicted_std, so legacy -> anchored is an affine
+# map with a DIFFERENT intercept per game ((1 - b_S) * spread_line), then a
+# per-game rescale, then a calibrator. Monotone within a game; not
+# order-preserving across games. Measured on the shipped parquet: Kendall tau
+# between |ml_edge| and |ml_edge_select| is 0.322 -- and that magnitude is
+# exactly what ML_EDGE_THRESHOLD_PROB's 0.10 bar tests. An anchored
+# probability is a genuinely DIFFERENT selector, not a rescaling of the
+# validated one.
+#
+# Consequence, measured: ML_EDGE_THRESHOLD_PROB = 0.10 is a constant
+# calibrated against the old raw-probability scale, and under anchoring it
+# almost never fires. The book collapses from 493 development / 154 holdout
+# bets to 75 / 1 with anchoring alone (r3b-E19) and 11 / 0 once Platt is added
+# (r3b-E14). Five attempts to rebuild it, all rejected:
+#   r2-E10, r3b-E15, r3b-E16 -- logistic stacking on the moneyline plus an
+#     adaptive bar. Development volume returns; the HOLDOUT book still
+#     collapses to 11 bets losing 24%.
+#   r4-E20 -- select on the anchored chain's legacy probability but reuse the
+#     ANCHORED std and the Platt calibrator. Scores well (development 442 bets
+#     +12.77%, holdout 138 +10.11%) but a reviewer refuted the justification
+#     with the Kendall tau above, and it is not the validated book: it drops
+#     31% of the baseline's development bets and 29% of its holdout bets. A
+#     new selector that happens to score well is exactly what this project's
+#     own history says not to trust.
+#   r4-E21 -- bar re-derived from break-even at the offered price. Fires on
+#     64% of games before the underdog filter: 950 development bets at +5.45%,
+#     224 holdout at -6.85%. Volume bought by loosening. Rejected.
+#
+# So "legacy_selection" invents no selector and retunes no bar. It runs the
+# legacy pipeline end to end for SELECTION only -- legacy margin
+# (predicted_margin_unanchored), the conditional std THAT prediction implies
+# (predicted_std_unanchored, not the anchored one: that shortcut is why E20
+# missed the validated book by 8 development bets), a dof fit from that same
+# legacy (margin, prediction, std) triple, and the ISOTONIC calibrator the
+# book was selected under, whatever CALIBRATION_METHOD the reported path has
+# moved to. ML_UNDERDOG_ONLY applies to the selection side. Everything
+# REPORTED -- model_home_prob, ml_edge, every probability on the board --
+# stays anchored and Platt-calibrated.
+ML_MARKET_MODE = "legacy_selection"
+
+# The calibration family the frozen moneyline SELECTOR uses, pinned
+# independently of CALIBRATION_METHOD. The validated book was selected under
+# isotonic; the reported probability has since moved to Platt because Platt is
+# the better-calibrated estimate (slope 0.995 vs 0.775). Those are two
+# different jobs, so they get two different constants -- otherwise changing
+# the reported curve family silently moves the bet book, which is exactly the
+# coupling ML_MARKET_MODE exists to break. Only read when ML_MARKET_MODE ==
+# "legacy_selection"; same allowed values as CALIBRATION_METHOD.
+ML_SELECT_CALIBRATION_METHOD = "isotonic"
+
 # Moneyline: restrict to underdog-side bets only.
 #
 # Measured directly against a blind "bet the underdog in these same games"

@@ -72,19 +72,29 @@ def _live_ats_threshold(
     return norm.ppf(p_breakeven) * sd / slope
 
 
-def _calibrate_live(hist_bets: pl.DataFrame, raw_col: str, outcome_expr: pl.Expr, live_raw: np.ndarray) -> np.ndarray:
+def _calibrate_live(
+    hist_bets: pl.DataFrame, raw_col: str, outcome_expr: pl.Expr, live_raw: np.ndarray,
+    method: str | None = None,
+) -> np.ndarray:
     """Fit one calibrator (probabilities.fit_calibrator, so the curve family
     follows config.CALIBRATION_METHOD exactly as the backtest's
     walk_forward_calibrate does) on ALL historical (raw prob, outcome) pairs
     -- no season-by-season split needed, since there's only one "current"
     bucket of upcoming games to apply it to -- and use it on the live raw
     probabilities. Falls back to the raw probability, unchanged, if there
-    isn't enough historical data yet (config.MIN_CALIBRATION_GAMES)."""
+    isn't enough historical data yet (config.MIN_CALIBRATION_GAMES).
+
+    `method` overrides the family for one caller and defaults to None, i.e.
+    config.CALIBRATION_METHOD, so every reported probability is unchanged. The
+    moneyline SELECTION path passes config.ML_SELECT_CALIBRATION_METHOD, the
+    same explicit isotonic pin backtesting.build_ml_bets uses."""
     hist = hist_bets.filter(pl.col(raw_col).is_not_null()).with_columns(outcome_expr.alias("_outcome"))
     hist = hist.filter(pl.col("_outcome").is_not_null()).to_pandas()
     if len(hist) < config.MIN_CALIBRATION_GAMES:
         return live_raw
-    calibrate = fit_calibrator(hist[raw_col].to_numpy(dtype=float), hist["_outcome"].to_numpy(dtype=float))
+    calibrate = fit_calibrator(
+        hist[raw_col].to_numpy(dtype=float), hist["_outcome"].to_numpy(dtype=float), method=method
+    )
     return calibrate(np.asarray(live_raw, dtype=float))
 
 
@@ -125,6 +135,51 @@ def build_upcoming_board(
     df["market_home_prob_no_vig"] = market_home_prob
     df["ml_edge"] = df["model_home_prob"] - df["market_home_prob_no_vig"]
 
+    # Moneyline analogue of the ATS split below, mirroring
+    # backtesting.build_ml_bets exactly: the DISPLAYED ml_edge comes from the
+    # market-anchored, calibrated probability above, while ml_qualifies is
+    # decided on the LEGACY probability -- legacy margin, the live legacy std
+    # (predicted_std_unanchored), a dof fit from that same legacy triple, and
+    # an isotonic live calibrator -- against the same unchanged bar. See
+    # config.ML_MARKET_MODE for why the moneyline selector is frozen rather
+    # than rescaled or retuned.
+    ml_select_legacy = (
+        config.ML_MARKET_MODE == "legacy_selection"
+        and "predicted_margin_unanchored" in df.columns
+        and "predicted_std_unanchored" in df.columns
+        # Every historical column the legacy path below reads. A parquet
+        # written by an older run has none of them; fall through to the
+        # reported edge rather than half-build the selector.
+        and all(
+            c in hist_ml_bets.columns
+            for c in ("model_home_prob_select_raw", "predicted_margin_unanchored", "predicted_std_unanchored")
+        )
+    )
+    if ml_select_legacy:
+        dof_select = fit_dof_all_history(
+            hist_ml_bets["home_margin"].to_numpy(),
+            hist_ml_bets["predicted_margin_unanchored"].to_numpy(),
+            hist_ml_bets["predicted_std_unanchored"].to_numpy(),
+        )
+        df["model_home_prob_select_raw"] = home_win_probability_t(
+            df["predicted_margin_unanchored"].to_numpy(),
+            df["predicted_std_unanchored"].to_numpy(),
+            dof_select,
+        )
+        if calibrate_ml:
+            df["model_home_prob_select"] = _calibrate_live(
+                hist_ml_bets, "model_home_prob_select_raw", pl.col("home_margin") > 0,
+                df["model_home_prob_select_raw"].to_numpy(),
+                method=config.ML_SELECT_CALIBRATION_METHOD,
+            )
+        else:
+            df["model_home_prob_select"] = df["model_home_prob_select_raw"]
+        df["ml_edge_select"] = df["model_home_prob_select"] - df["market_home_prob_no_vig"]
+    else:
+        df["model_home_prob_select_raw"] = df["model_home_prob_raw"]
+        df["model_home_prob_select"] = df["model_home_prob"]
+        df["ml_edge_select"] = df["ml_edge"]
+
     # Selection rules, carried over from the backtest so the live board and
     # the validated backtest agree on what counts as a pick -- including the
     # split between the REPORTED edge (market-anchored, shown on the board)
@@ -154,9 +209,13 @@ def build_upcoming_board(
     df["ats_edge_shrunk"] = df["ats_edge"] * _live_shrinkage_slope(hist_ats_bets)
 
     df["ml_threshold_used"] = config.ML_EDGE_THRESHOLD_PROB
+    # The bar actually applied, stored for symmetry with
+    # ats_select_threshold_used and with the backtest's column of the same
+    # name, so a board row carries the number it was selected under.
+    df["ml_select_threshold_used"] = config.ML_EDGE_THRESHOLD_PROB
     ml_side = np.where(
-        df["ml_edge"] > config.ML_EDGE_THRESHOLD_PROB, "home",
-        np.where(df["ml_edge"] < -config.ML_EDGE_THRESHOLD_PROB, "away", "none"),
+        df["ml_edge_select"] > config.ML_EDGE_THRESHOLD_PROB, "home",
+        np.where(df["ml_edge_select"] < -config.ML_EDGE_THRESHOLD_PROB, "away", "none"),
     )
     if config.ML_UNDERDOG_ONLY:
         favorite_side = np.where(df["spread_line"].to_numpy() > 0, "home", "away")

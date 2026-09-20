@@ -346,20 +346,30 @@ def _anchor_log(base_cols: list[str], b: np.ndarray, market_col: str) -> str:
     return " ".join(f"b({c.replace('pred_', '')})={v:.3f}" for c, v in zip(base_cols, b)) + f" anchor={market_col}"
 
 
-def _legacy_meta_predict(X_train, y_train, X_test, base_cols: list[str]) -> tuple[np.ndarray, str]:
+def _legacy_meta_predict(X_train, y_train, X_test, base_cols: list[str]) -> tuple[np.ndarray, np.ndarray, str]:
     """The ENSEMBLE_MARKET_ANCHOR = None ensemble, fit on the side: the same
     Ridge(alpha=1.0) WITH intercept on the base-model predictions alone
     (predicted = a + w * pred_ridge), on the same rows the `else` branches of
     walk_forward_ensemble / predict_upcoming_ensemble would use. In
     "constrained" mode it fills `{pred_col}_unanchored`, so bet selection
-    (config.ATS_SELECT_ON_UNANCHORED) runs on exactly the edge the README
-    validated its thresholds on and reproduces that bet book. Frame-agnostic:
-    pandas from _prep_xy in walk-forward, the live pandas frame for upcoming
-    games -- both are indexed by column name."""
+    (config.ATS_SELECT_ON_UNANCHORED, config.ML_MARKET_MODE) runs on exactly
+    the edge the README validated its thresholds on and reproduces that bet
+    book. Frame-agnostic: pandas from _prep_xy in walk-forward, the live
+    pandas frame for upcoming games -- both are indexed by column name.
+
+    Returns (test prediction, TRAIN prediction, log line). The train
+    prediction is not cosmetic: the conditional-std model's first-fold
+    fallback is fit on `target - train_pred`, so a legacy std meant to equal
+    the unanchored run's std bit-for-bit needs the LEGACY train prediction
+    there, not the anchored one."""
     meta = Ridge(alpha=1.0)
     meta.fit(X_train[base_cols], y_train)
     weights = " ".join(f"weight({c.replace('pred_', '')})={w:.4f}" for c, w in zip(base_cols, meta.coef_))
-    return meta.predict(X_test[base_cols]), f"{weights} intercept={meta.intercept_:.4f}"
+    return (
+        meta.predict(X_test[base_cols]),
+        meta.predict(X_train[base_cols]),
+        f"{weights} intercept={meta.intercept_:.4f}",
+    )
 
 
 def walk_forward_ensemble(
@@ -402,6 +412,11 @@ def walk_forward_ensemble(
     # bias in place on one path and not the other.
     oof_ctx: list[pl.DataFrame] = []
     oof_resid: list[np.ndarray] = []
+    # Second, parallel residual pool for the LEGACY (unanchored) prediction --
+    # see predicted_std_unanchored below. Same rows, same order, same
+    # fold-by-fold accumulation; only the prediction the residual is taken
+    # against differs.
+    oof_resid_unanchored: list[np.ndarray] = []
 
     for test_season in test_seasons:
         train_df = merged.filter(pl.col("season") < test_season)
@@ -431,7 +446,9 @@ def walk_forward_ensemble(
             # slope and the bar derived from it are not invariant to the meta
             # intercept, so selecting on raw pred_ridge moved the bet
             # universe (r3-E18: 813 dev bets against the validated 692).
-            pred_unanchored, legacy_log = _legacy_meta_predict(X_train, y_train, X_test, base_cols)
+            pred_unanchored, train_pred_unanchored, legacy_log = _legacy_meta_predict(
+                X_train, y_train, X_test, base_cols
+            )
             fit_log = f"{_anchor_log(base_cols, b, market_col)} | legacy {legacy_log}"
         else:
             meta = Ridge(alpha=1.0)
@@ -442,6 +459,7 @@ def walk_forward_ensemble(
             # unanchored column is the prediction itself and every consumer
             # of it collapses to today's behaviour.
             pred_unanchored = pred
+            train_pred_unanchored = train_pred
             weights = " ".join(f"weight({c.replace('pred_', '')})={w:.2f}" for c, w in zip(meta_cols, meta.coef_))
             fit_log = f"{weights} intercept={meta.intercept_:.2f}"
 
@@ -449,19 +467,41 @@ def walk_forward_ensemble(
         if n_oof >= config.MIN_OOF_STD_GAMES:
             std_fit_df = pl.concat(oof_ctx, how="vertical_relaxed")
             std_fit_resid = np.concatenate(oof_resid)
+            std_fit_resid_unanchored = np.concatenate(oof_resid_unanchored)
         else:
             std_fit_df = train_df
             std_fit_resid = y_train.to_numpy() - train_pred
+            std_fit_resid_unanchored = y_train.to_numpy() - train_pred_unanchored
 
         out = test_df.select(["game_id", "season", "week", "home_team", "away_team", target_col]).to_pandas()
         out[pred_col] = pred
         out[f"{pred_col}_unanchored"] = pred_unanchored
         out["predicted_std"] = _fit_predict_conditional_std(std_fit_df, test_df, std_fit_resid)
+        # The conditional std the LEGACY prediction implies. Identical model,
+        # identical training pool, identical fold ordering -- the ONLY
+        # difference is that the |residual| target is taken against
+        # pred_unanchored instead of the anchored pred.
+        #
+        # Why it has to exist: for the SPREAD, anchoring cancels
+        # (anchored - line = b * (legacy - line), one positive scalar per
+        # season), so selecting on the legacy edge needs nothing but the
+        # legacy margin. In the PROBABILITY domain it does not cancel --
+        # home_win_probability_t divides by a PER-GAME std -- so a legacy
+        # margin divided by the ANCHORED std is neither the legacy
+        # probability nor the anchored one. That mismatch is exactly why
+        # round-4 E20's moneyline book missed the validated one by 8
+        # development bets. When ENSEMBLE_MARKET_ANCHOR is None,
+        # pred_unanchored IS pred, so this column equals predicted_std
+        # exactly and every consumer collapses to previous behaviour.
+        out["predicted_std_unanchored"] = _fit_predict_conditional_std(
+            std_fit_df, test_df, std_fit_resid_unanchored
+        )
         out["model"] = model_name
         all_preds.append(out)
 
         oof_ctx.append(test_df.select(_std_context_columns(test_df)))
         oof_resid.append(y_test.to_numpy() - pred)
+        oof_resid_unanchored.append(y_test.to_numpy() - pred_unanchored)
 
         logger.info(f"[{model_name}] {test_season}: {fit_log}")
 
@@ -643,7 +683,9 @@ def predict_upcoming_ensemble(
         # out), exactly as the `else` branch does for the live frame when
         # ENSEMBLE_MARKET_ANCHOR is None. Set BEFORE the base-model columns
         # are dropped below, since it reads them off `live`.
-        live[f"{pred_col}_unanchored"], legacy_log = _legacy_meta_predict(X_train, y_train, live, base_cols)
+        live[f"{pred_col}_unanchored"], train_pred_unanchored, legacy_log = _legacy_meta_predict(
+            X_train, y_train, live, base_cols
+        )
         fit_log = f"{_anchor_log(base_cols, b, market_col)} | legacy {legacy_log}"
     else:
         meta = Ridge(alpha=1.0)
@@ -651,6 +693,7 @@ def predict_upcoming_ensemble(
         train_pred = meta.predict(X_train)
         live[pred_col] = meta.predict(live[meta_cols])
         live[f"{pred_col}_unanchored"] = live[pred_col]
+        train_pred_unanchored = train_pred
         weights = " ".join(f"weight({c.replace('pred_', '')})={w:.2f}" for c, w in zip(meta_cols, meta.coef_))
         fit_log = f"{weights} intercept={meta.intercept_:.2f}"
     # Drop only the base-model prediction columns -- never the market column;
@@ -665,6 +708,14 @@ def predict_upcoming_ensemble(
     hist_ctx = hist.join(modeling_table.select(_STD_CONTEXT_COLS), on="game_id", how="left")
     live_ctx = pl.from_pandas(live[["game_id"]]).join(modeling_table.select(_STD_CONTEXT_COLS), on="game_id", how="left")
     live["predicted_std"] = _fit_predict_conditional_std(hist_ctx, live_ctx, resid)
+    # Live analogue of predicted_std_unanchored in walk_forward_ensemble: the
+    # same fit on the same rows, against the LEGACY prediction's residuals, so
+    # the live moneyline selection path can be the legacy pipeline end to end
+    # (config.ML_MARKET_MODE). Equals predicted_std exactly when
+    # ENSEMBLE_MARKET_ANCHOR is None.
+    live["predicted_std_unanchored"] = _fit_predict_conditional_std(
+        hist_ctx, live_ctx, y_train.to_numpy() - train_pred_unanchored
+    )
 
     logger.info(f"[ensemble live] {fit_log}")
     return live

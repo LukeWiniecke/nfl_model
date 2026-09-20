@@ -51,10 +51,13 @@ def decide_bet_side(df: pd.DataFrame, market: str, threshold, edge_col: str | No
 
     `edge_col` names the column to SELECT on, and defaults to the market's
     reported edge, which is what every existing caller (the dashboard
-    included) wants. build_ats_bets passes `ats_edge_select` instead so the
-    reported edge can be market-anchored while selection stays on the
-    unanchored scale the thresholds were validated on -- see
-    config.ATS_SELECT_ON_UNANCHORED.
+    included) wants. build_ats_bets passes `ats_edge_select` and build_ml_bets
+    passes `ml_edge_select` instead, so the reported edge can be
+    market-anchored (and, on the moneyline, Platt-calibrated) while selection
+    stays on the scale the thresholds were validated on -- see
+    config.ATS_SELECT_ON_UNANCHORED and config.ML_MARKET_MODE. The moneyline
+    underdog-only restriction below is applied AFTER `edge_col` has picked a
+    side, i.e. it restricts the SELECTION side.
     """
     if edge_col is None:
         edge_col = "ats_edge" if market == "ats" else "ml_edge"
@@ -160,7 +163,9 @@ def regrade_ats(df: pd.DataFrame, threshold: float, edge_col: str = "ats_edge") 
     return df
 
 
-def regrade_ml(df: pd.DataFrame, threshold, underdog_only: bool | None = None) -> pd.DataFrame:
+def regrade_ml(
+    df: pd.DataFrame, threshold, underdog_only: bool | None = None, edge_col: str | None = None
+) -> pd.DataFrame:
     """Same idea as regrade_ats, for the moneyline market: given a table that
     already has `ml_edge`, `home_margin`, and moneylines, (re)decide bet_side
     at `threshold` and grade it.
@@ -169,14 +174,24 @@ def regrade_ml(df: pd.DataFrame, threshold, underdog_only: bool | None = None) -
     would land on the market favorite. See that constant's note: split by
     side, the model's favorite-side moneyline bets lost money at every
     threshold tested, while its underdog bets carried the entire return.
+
+    `edge_col` names the column to SELECT on and defaults to the reported
+    `ml_edge`, so the dashboard's regrade path and
+    optimal_threshold_walk_forward are unchanged; build_ml_bets passes
+    `ml_edge_select` so the reported probability can be market-anchored and
+    Platt-calibrated while selection stays on the legacy probability scale
+    ML_EDGE_THRESHOLD_PROB was validated on (config.ML_MARKET_MODE). Only the
+    SIDE decision uses it -- grading is against the realized result either
+    way, which is why moving the selection scale can change which games are
+    bet but never how a bet resolves.
     """
     df = df.reset_index(drop=True)  # see regrade_ats -- bet_won needs a clean 0..n-1 index to align against
     if underdog_only is None or underdog_only == config.ML_UNDERDOG_ONLY:
-        df["bet_side"] = decide_bet_side(df, "ml", threshold)
+        df["bet_side"] = decide_bet_side(df, "ml", threshold, edge_col=edge_col)
     else:
         # Explicit override (used to A/B the restriction itself); spread_line
         # > 0 means the HOME team is favored, so the underdog is away.
-        side = _bet_side(df["ml_edge"].to_numpy(), threshold)
+        side = _bet_side(df[edge_col or "ml_edge"].to_numpy(), threshold)
         if underdog_only:
             favorite_side = np.where(df["spread_line"].to_numpy() > 0, "home", "away")
             side = np.where(side == favorite_side, "none", side)
@@ -206,15 +221,24 @@ def regrade_ml(df: pd.DataFrame, threshold, underdog_only: bool | None = None) -
     return df
 
 
-def _fit_dof_or_default(df: pd.DataFrame, actual_col: str, predicted_col: str) -> np.ndarray:
-    """fit_t_dof_walk_forward needs a real per-game predicted_std column to
-    standardize residuals against; falls back to config.DEFAULT_T_DOF
-    (practically Normal) in the defensive edge case where the caller only
-    has a single scalar margin_std/total_std (same edge case build_ats_bets/
-    build_ml_bets/build_totals_bets already defend against for `std` itself)."""
-    if "predicted_std" not in df.columns:
+def _fit_dof_or_default(
+    df: pd.DataFrame, actual_col: str, predicted_col: str, std_col: str = "predicted_std"
+) -> np.ndarray:
+    """fit_t_dof_walk_forward needs a real per-game std column to standardize
+    residuals against; falls back to config.DEFAULT_T_DOF (practically Normal)
+    in the defensive edge case where the caller only has a single scalar
+    margin_std/total_std (same edge case build_ats_bets/build_ml_bets/
+    build_totals_bets already defend against for `std` itself).
+
+    `std_col` defaults to the reported predicted_std, so every pre-existing
+    caller is unchanged. The moneyline SELECTION path passes
+    "predicted_std_unanchored" together with predicted_margin_unanchored, so
+    the tail shape is fit from the LEGACY (margin, prediction, std) triple
+    rather than a legacy prediction standardized by an anchored std -- see
+    config.ML_MARKET_MODE."""
+    if std_col not in df.columns:
         return np.full(len(df), config.DEFAULT_T_DOF)
-    return fit_t_dof_walk_forward(df, actual_col, predicted_col, "predicted_std")
+    return fit_t_dof_walk_forward(df, actual_col, predicted_col, std_col)
 
 
 def build_ats_bets(preds_with_market: pl.DataFrame, margin_std: float) -> pl.DataFrame:
@@ -295,16 +319,72 @@ def build_ml_bets(preds_with_market: pl.DataFrame, margin_std: float, calibrate:
     df = preds_with_market.to_pandas().copy()
     std = df["predicted_std"] if "predicted_std" in df.columns else margin_std
     dof = _fit_dof_or_default(df, "home_margin", "predicted_margin")
+    home_win = (df["home_margin"] > 0).to_numpy().astype(float)
+
+    # REPORTED probability and edge, unchanged: the anchored margin through
+    # Student-t and the walk-forward calibrator of the day
+    # (config.CALIBRATION_METHOD). This is the pair that beats the market on
+    # Brier, and it is what every downstream view displays.
     df["model_home_prob_raw"] = home_win_probability_t(df["predicted_margin"], std, dof)
     if calibrate:
-        home_win = (df["home_margin"] > 0).to_numpy().astype(float)
         df["model_home_prob"] = walk_forward_calibrate(df, "model_home_prob_raw", home_win)
     else:
         df["model_home_prob"] = df["model_home_prob_raw"]
     market_home_prob, _ = market_moneyline_no_vig(df["home_moneyline"], df["away_moneyline"])
     df["market_home_prob_no_vig"] = market_home_prob
     df["ml_edge"] = df["model_home_prob"] - df["market_home_prob_no_vig"]
-    df = regrade_ml(df, config.ML_EDGE_THRESHOLD_PROB)
+
+    # SELECTION probability and edge: the LEGACY pipeline end to end, so
+    # nothing about anchoring or Platt can reach the bet book. Legacy margin,
+    # the conditional std THAT prediction implies, a dof fit from that same
+    # legacy triple, and the ISOTONIC calibrator the book was selected under.
+    # Not a rescaling of the reported edge -- see config.ML_MARKET_MODE for
+    # why it cannot be one (Kendall tau 0.322) and why the selector is frozen
+    # rather than retuned. With the mode set to "anchored", or for a model
+    # that emits no unanchored columns (ridge/lgbm never anchor), this
+    # collapses to the reported pair and the output is byte-identical to the
+    # pre-split behaviour.
+    select_legacy = (
+        config.ML_MARKET_MODE == "legacy_selection"
+        and "predicted_margin_unanchored" in df.columns
+        and "predicted_std_unanchored" in df.columns
+    )
+    if select_legacy:
+        std_select = df["predicted_std_unanchored"]
+        dof_select = _fit_dof_or_default(
+            df, "home_margin", "predicted_margin_unanchored", "predicted_std_unanchored"
+        )
+        df["model_home_prob_select_raw"] = home_win_probability_t(
+            df["predicted_margin_unanchored"], std_select, dof_select
+        )
+        if calibrate:
+            # ISOTONIC explicitly, not config.CALIBRATION_METHOD: the family
+            # is part of the validated selector, so the reported path can move
+            # to Platt without moving the bet book. The per-model `calibrate`
+            # switch is respected exactly as above, so lgbm still skips this.
+            df["model_home_prob_select"] = walk_forward_calibrate(
+                df, "model_home_prob_select_raw", home_win, method=config.ML_SELECT_CALIBRATION_METHOD
+            )
+        else:
+            df["model_home_prob_select"] = df["model_home_prob_select_raw"]
+        df["ml_edge_select"] = df["model_home_prob_select"] - df["market_home_prob_no_vig"]
+        logger.info(
+            f"[ml] selecting on the legacy probability: median |ml_edge_select|="
+            f"{np.nanmedian(np.abs(df['ml_edge_select'])):.4f} vs reported "
+            f"{np.nanmedian(np.abs(df['ml_edge'])):.4f} (bar {config.ML_EDGE_THRESHOLD_PROB})"
+        )
+    else:
+        df["model_home_prob_select_raw"] = df["model_home_prob_raw"]
+        df["model_home_prob_select"] = df["model_home_prob"]
+        df["ml_edge_select"] = df["ml_edge"]
+
+    # The bar actually applied, stored for symmetry with
+    # ats_select_threshold_used. ML_EDGE_THRESHOLD_PROB is a fixed constant,
+    # not a derived per-game bar, so this is a single value -- the point is
+    # that the saved book carries the number it was selected under instead of
+    # leaving a reader to infer it from config.
+    df["ml_select_threshold_used"] = config.ML_EDGE_THRESHOLD_PROB
+    df = regrade_ml(df, config.ML_EDGE_THRESHOLD_PROB, edge_col="ml_edge_select")
     return pl.from_pandas(df)
 
 

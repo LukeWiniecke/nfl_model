@@ -253,10 +253,10 @@ def _logit_feature(prob: np.ndarray) -> np.ndarray:
     return np.log(p / (1.0 - p)).reshape(-1, 1)
 
 
-def fit_calibrator(train_prob: np.ndarray, train_outcome: np.ndarray):
+def fit_calibrator(train_prob: np.ndarray, train_outcome: np.ndarray, method: str | None = None):
     """Fit ONE recalibration curve on (raw prob, outcome) training pairs and
-    return it as a callable raw_prob -> calibrated_prob. The curve family is
-    chosen by config.CALIBRATION_METHOD (see the note there for why):
+    return it as a callable raw_prob -> calibrated_prob. The curve family
+    defaults to config.CALIBRATION_METHOD (see the note there for why):
 
       'platt'    -- logistic regression of outcome on logit(raw prob), two
                     parameters (slope + intercept): can stretch/compress a
@@ -266,10 +266,17 @@ def fit_calibrator(train_prob: np.ndarray, train_outcome: np.ndarray):
 
     Shared by walk_forward_calibrate (backtest) and live_picks._calibrate_live
     (upcoming board) so the two can never disagree on the curve family.
+
+    `method` overrides the config default for ONE caller. It exists for the
+    moneyline SELECTION path (config.ML_MARKET_MODE = "legacy_selection"),
+    which has to reproduce the validated bet book exactly and therefore has to
+    keep the isotonic curve that book was selected under, whatever family the
+    REPORTED probability has since moved to. Every other caller passes None
+    and follows config.CALIBRATION_METHOD as before.
     """
     train_prob = np.asarray(train_prob, dtype=float)
     train_outcome = np.asarray(train_outcome, dtype=float)
-    method = config.CALIBRATION_METHOD
+    method = config.CALIBRATION_METHOD if method is None else method
     if method == "platt":
         lr = LogisticRegression(C=config.PLATT_C, max_iter=config.PLATT_MAX_ITER)
         lr.fit(_logit_feature(train_prob), train_outcome)
@@ -278,10 +285,10 @@ def fit_calibrator(train_prob: np.ndarray, train_outcome: np.ndarray):
         iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
         iso.fit(train_prob, train_outcome)
         return lambda p: iso.predict(np.asarray(p, dtype=float))
-    raise ValueError(f"unknown config.CALIBRATION_METHOD {method!r}; expected 'platt' or 'isotonic'")
+    raise ValueError(f"unknown calibration method {method!r}; expected 'platt' or 'isotonic'")
 
 
-def walk_forward_calibrate(df, prob_col: str, outcome: np.ndarray) -> np.ndarray:
+def walk_forward_calibrate(df, prob_col: str, outcome: np.ndarray, method: str | None = None) -> np.ndarray:
     """Recalibrate a raw predicted probability season-by-season: for each
     season, fit a calibration curve (config.CALIBRATION_METHOD -- Platt
     logistic scaling by default, isotonic previously; see fit_calibrator)
@@ -294,6 +301,8 @@ def walk_forward_calibrate(df, prob_col: str, outcome: np.ndarray) -> np.ndarray
     unchanged.
 
     `df` must have a `season` column aligned with `prob_col` and `outcome`.
+    `method` is passed straight through to fit_calibrator; None (the default)
+    means config.CALIBRATION_METHOD, so every pre-existing caller is unchanged.
     """
     prob = df[prob_col].to_numpy(dtype=float)
     season = df["season"].to_numpy()
@@ -305,7 +314,7 @@ def walk_forward_calibrate(df, prob_col: str, outcome: np.ndarray) -> np.ndarray
         test_mask = season == s
         if train_mask.sum() < config.MIN_CALIBRATION_GAMES:
             continue
-        calibrate = fit_calibrator(prob[train_mask], outcome[train_mask])
+        calibrate = fit_calibrator(prob[train_mask], outcome[train_mask], method=method)
         out[test_mask] = calibrate(prob[test_mask])
 
     return out
