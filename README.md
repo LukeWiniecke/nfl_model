@@ -47,22 +47,63 @@ lines — spread and moneyline — from 2010 through the latest completed season
 
 ## Key finding
 
-**The model does not beat the market baseline on raw prediction accuracy.**
-All three models have higher MAE/RMSE/Brier score than simply reading the
-market's own closing line as the prediction (see the Diagnostics tab). Any
-positive backtest ROI elsewhere should be read cautiously, not as confirmed
-evidence of skill — this is exactly what you'd expect from an efficient
-market and a fundamentals model built on largely public information. That
-gap has narrowed since QB-level features were added and again with the
-ensemble (see below), but it has not closed: ensemble MAE 10.13 vs. market
-9.93.
+**The ensemble now matches the closing line on MAE and beats it on RMSE and
+on moneyline Brier score — but read carefully what that does and does not
+mean.** It is achieved by *anchoring* the prediction to the line:
+`predicted_margin = spread_line + b·(model − spread_line)`, with the single
+coefficient `b` fit through the origin on strictly earlier seasons (see
+`config.ENSEMBLE_MARKET_ANCHOR`). Measured walk-forward, `b` runs about
+0.11–0.35, which is the honest statement that only a fifth to a third of the
+model's disagreement with the market survives contact with reality. The
+model is therefore not out-predicting the market from fundamentals; it is
+adding a small, correctly-sized correction on top of it. That is still a
+real improvement on the previous state, where the same shrinkage was applied
+only at the betting layer while every *reported* number — the Diagnostics
+tab, the probabilities, the live board — used the unshrunk prediction.
 
-The one genuinely new result: for the first time, a model — the ensemble —
-shows a **positive flat-stake ROI in both markets at once** (ATS +0.4%, ML
-+0.3%). Bootstrapped 95% confidence intervals on both cross zero
-comfortably (ATS: [-3.7%, +4.7%], ML: [-4.4%, +5.2%]), so this is *not*
-statistically distinguishable from noise yet — treat it as "the most
-promising model so far," not "found an edge."
+Development era, ensemble, against the closing line:
+
+| | Before anchoring | Now |
+|---|---|---|
+| MAE gap vs market | +0.192 | **−0.001** |
+| RMSE gap vs market | +0.172 | **−0.018** |
+| Moneyline Brier vs market | +0.0058 | **−0.0006** |
+| Moneyline calibration slope | 0.775 | **0.995** |
+| Cover-probability calibration slope | 0.003 | **0.520** |
+
+A calibration slope of 1.0 is perfectly calibrated. The moneyline Brier line
+is the first time in this project that the model's win probability has beaten
+the market's.
+
+**The bet book is unchanged, deliberately.** Anchoring rescales the
+selection signal, and re-deriving thresholds on the rescaled scale would
+double-apply a shrinkage the betting layer already estimates — that is
+exactly what cost 30% of the bets in the first attempts. Both markets
+therefore select on the frozen pre-anchoring signal (`ats_edge_select` /
+`ml_edge_select`), and the ensemble places precisely the bets the ROI
+numbers elsewhere in this README describe: 692 development and 96 holdout
+ATS bets, 493 and 154 moneyline, bet for bet, with identical profit on every
+one. Two independent reviews verified that against the pre-change tables.
+
+Flat-stake ROI is therefore unchanged: ATS +8.0% development (95% CI
+[+1.1%, +15.2%]) and +5.3% holdout; moneyline +12.1% development (95% CI
+[+0.2%, +24.6%]) and +2.1% holdout. Those intervals are wide and the holdout
+samples small, so this remains "the most promising model so far," not "found
+an edge."
+
+**Why the moneyline selector is frozen rather than rebuilt.** For the spread,
+anchoring cancels: `anchored − spread = b·(model − spread)`, a single
+positive scalar per season, so the ranking of games is identical and
+reporting one while selecting on the other is information-free. In the
+probability domain it does not cancel — each game picks up a different
+intercept `(1−b)·spread_line` and is then divided by its own predicted std —
+so an anchored probability is a genuinely *different* selector, not a
+rescaling. Measured Kendall tau between the old and new selection
+magnitudes: 0.25–0.32. Six attempts to build a moneyline selector under
+anchoring (logistic stacking plus an adaptive bar, a break-even bar, and
+selecting on the anchored-chain legacy probability) either collapsed out of
+sample or bought volume by loosening the bar. All are recorded in
+`results.tsv`; the open question is flagged in `BUGS.md`.
 
 ## What's worked, and what hasn't (in order tried)
 

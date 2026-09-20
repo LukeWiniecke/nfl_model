@@ -88,17 +88,37 @@ rating values were correct; only the presentation was wrong.
 **Fix:** `played` flag on the history; chart ends on the current rating;
 leaderboard labelled from the last completed game.
 
-## 4. Weekly refresh scheduled task dies silently after wake-from-sleep — PARTIALLY FIXED
+## 4. Weekly refresh scheduled task dies silently after wake-from-sleep — FIXED (root cause found 2026-09-20)
 
-**Status:** task re-registered 2026-09-20 with `-WindowStyle Hidden` (the
-console that could be closed no longer appears). The more robust fix, an
-S4U principal so the task does not depend on the interactive session at
-all, was refused with "Access is denied" from an unelevated shell;
-`scripts/setup_weekly_refresh.ps1` now tries S4U first and falls back, so
-rerunning it from an elevated PowerShell upgrades the task. A manual
-`Start-ScheduledTask` test is scheduled after round 3 finishes (it rewrites
-the outputs the reviewers are reading). Next scheduled run: Tue 2026-09-22
-08:00. Root cause remains inferred, not proven.
+**Root cause: the two battery guards, which `New-ScheduledTaskSettingsSet`
+defaults to true and the original setup script never overrode.**
+
+- `DisallowStartIfOnBatteries` means the task will not start at all on
+  battery. Reproduced directly: a manual `Start-ScheduledTask` on battery sat
+  in state "Queued" for over ten minutes, never ran, `LastTaskResult` 0x0, no
+  log file created.
+- `StopIfGoingOnBatteries` means a *running* task is forcibly terminated the
+  moment the machine drops to battery. This is a better explanation for the
+  two 0xC000013A (STATUS_CONTROL_C_EXIT) deaths than the visible-console
+  theory originally recorded here: a laptop waking from sleep is exactly when
+  it is likely to be on battery, and a forced stop mid-run gives an abrupt
+  exit code and a truncated log. Both failures were ~7 s after launch with
+  0-byte logs, right after a late start following wake.
+
+**Fix:** `scripts/setup_weekly_refresh.ps1` now passes
+`-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries`. A weekly two-minute
+refresh has no reason to be power-gated. `-WindowStyle Hidden` is kept as a
+second, independent hardening (a visible console is another way for a run to
+be killed).
+
+**Verified:** re-registered and triggered manually while on battery at 80%
+charge. Ran to completion, result 0x0, 16 KB log, full pipeline plus 93 rows
+appended to the picks log. Next scheduled run Tue 2026-09-22 08:00.
+
+**Still optional:** an S4U principal, so the task does not depend on an
+interactive session at all, needs the "log on as a batch job" right and is
+refused unelevated. The script attempts it first and falls back with a
+warning; rerunning it from an elevated PowerShell upgrades the task.
 
 **Where:** Windows task "NFL Model Weekly Refresh" (`scripts/setup_weekly_refresh.ps1`).
 **What:** died 2026-08-18 and 2026-09-15 with result 0xC000013A
@@ -109,7 +129,33 @@ that can be closed, and only while the user is logged on.
 **Fix:** register the action with `-WindowStyle Hidden` and an S4U principal
 so it does not depend on the interactive session; verify with a manual run.
 
-## 11. Dashboard would read the wrong edge column under an anchored ensemble — OPEN (blocks adoption of E19)
+## 13. LightGBM and ridge moneyline books move under the global Platt switch — ACCEPTED, not a defect
+
+**What:** adopting Platt in place of isotonic (`CALIBRATION_METHOD`) changes
+every model's *reported* probability, and for models that are not anchored
+the reported probability is also the selection one. So `ridge_baseline`'s
+moneyline book moved to 596 bets from the baseline's 623 (139 added, 166
+dropped, profit 64.6 against 58.1). `lgbm` is unchanged because
+`calibrate=False` for it, and both ATS books are unchanged.
+**Why it is accepted:** the ensemble is the flagship and is unaffected, its
+moneyline book being frozen bit-for-bit by item 14's selector split. Ridge
+and LightGBM are reported as comparison models. Verified independently that
+this is the calibrator and not the selector freeze: ridge has no
+`predicted_margin_unanchored` column, and its `model_home_prob_select`
+equals `model_home_prob` exactly on all 3,579 rows.
+**If the desk wants ridge frozen too,** that is a separate decision about
+whether `ML_MARKET_MODE` should also pin the calibrator for unanchored
+models.
+
+## 11. Dashboard would read the wrong edge column under an anchored ensemble — FIXED (c1d54db)
+
+**Status:** `selection_edge_col()` and `pipeline_threshold_col()` in the
+dashboard prefer `*_edge_select` / `*_select_threshold_used` when present and
+fall back to the reported columns for older parquets; the three call sites
+pass `edge_col` through. Verified after the change: all six model/market
+combinations reproduce the saved book bet-for-bet with zero profit
+difference. Before it, the moneyline regrade gave 11 bets against the saved
+647 and the spread 573 against 788.
 
 **Where:** `app/streamlit_app.py` `regraded_bets` and the two `decide_bet_side`
 call sites; `backtesting.regrade_ats` / `decide_bet_side` default to `ats_edge`.
