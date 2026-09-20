@@ -10,15 +10,36 @@ the production model) · **LIMITATION** (known, not fixable with current data).
 
 ---
 
-## 1. Team rolling form is null for any game beyond the current week — FIXED (2afa00d)
+## 1. Team rolling form is wrong for games beyond the current week — FIXED (2afa00d, completed by f306990)
 
-**Status:** `feature_engineering._carry_form_into_unplayed` forward-fills
-within team into unplayed rows only. Verified on 2026-09-20: all eleven
-prediction and bet tables byte-identical to the baseline run, played rows of
-the modeling table identical, and the six team-form features have 0 nulls
-on all 31 upcoming games (was 16) and on all 255 unplayed 2026 games.
-Twenty of 31 live predictions changed; qualifying picks went from 1 ATS /
-6 ML to 2 ATS / 5 ML. Independently reviewed as part of round 3.
+**Status:** fixed in two passes, because the first was only half of it.
+
+`2afa00d` added `feature_engineering._carry_form_into_unplayed`, forward-filling
+nulls within team into unplayed rows only. That repaired the `*_ewm` columns:
+the six team-form features went from 16 of 31 upcoming games null to 0, and
+0 nulls across all 255 unplayed 2026 games.
+
+**An adversarial review then showed the `*_roll8` columns were untouched by
+that fix, because they were never null.** `rolling_mean(min_samples=1)` skips
+nulls inside its window instead of returning null, so a team's k-th unplayed
+game averaged its last `window - k + 1` completed games: a sample that shrinks
+week by week until it is a single game, and then sticks there. Measured drift
+on `margin_roll8` against the team's true current form: 1.4 points at the next
+game, 2.5 at the one after, 11.1 by the eighth. LightGBM consumes every
+`*_roll8_diff` (`modeling.gbm_feature_columns`), so this reached the LightGBM
+rows of the live board; ridge reads only the `_ewm` columns and was unaffected
+by this second failure, and the ensemble excludes LightGBM.
+
+`f306990` sources the carried value explicitly from each team's FIRST unplayed
+game, the only scheduled row whose window is entirely completed games, then
+forward-fills. Verified: every form column is now constant across each team's
+unplayed rows with zero nulls (Kansas City holds -2.25 for every remaining
+week, against -2.25 / -3.0 / ... / 21.0 before), the backtest is byte-identical
+across 13 prediction, bet and contribution tables, and played rows of the
+modeling table are unchanged.
+
+**Lesson worth keeping:** the two rolling functions in `_rolling_exprs` have
+opposite null semantics. Any future change there must check both.
 
 **Where:** `feature_engineering._rolling_exprs` / `add_rolling_form`.
 **What:** rolling form is `shift(1).over(team)` then `ewm_mean(min_samples=1)`.
@@ -87,6 +108,29 @@ inferred, not proven: the task runs interactively with a visible console
 that can be closed, and only while the user is logged on.
 **Fix:** register the action with `-WindowStyle Hidden` and an S4U principal
 so it does not depend on the interactive session; verify with a manual run.
+
+## 11. Dashboard would read the wrong edge column under an anchored ensemble — OPEN (blocks adoption of E19)
+
+**Where:** `app/streamlit_app.py` `regraded_bets` and the two `decide_bet_side`
+call sites; `backtesting.regrade_ats` / `decide_bet_side` default to `ats_edge`.
+**What:** the adopted candidate E19 reports the anchored margin but selects
+bets on `ats_edge_select` / `ats_select_threshold_used`. The dashboard reads
+`ats_edge` / `ats_threshold_used`, which under E19 are the anchored (roughly
+4x smaller) display values. The reviewer measured it against the E19 parquet:
+"Pipeline (per game)" mode yields 573 bets agreeing with the stored book on
+only 2,987 of 3,312 rows, and the manual 3.5-point slider yields 4 bets.
+**Not yet a live defect** — E19 is not merged, and against today's parquets the
+dashboard is correct. Must be fixed in the same change that merges E19: prefer
+the `_select` columns when present, fall back to the current ones.
+
+## 12. Column semantics change silently under anchoring — OPEN (documentation, blocks adoption)
+
+**What:** under E19, `ats_edge_shrinkage` (median 0.911 vs the baseline's
+0.258) and `ats_edge_shrunk` describe shrinkage of an already-anchored edge,
+and the scorer's reported shrink slope and threshold (0.921 / 1.14 against
+0.258 / 3.50) are on the reported scale. Same names, different meaning, so
+any comparison against a pre-anchoring run is invalid unless it is stated.
+Needs a note in `config.py` and the dashboard's Methodology tab at merge time.
 
 ## 5. Adaptive moneyline threshold can go negative — EXPERIMENT-ONLY
 

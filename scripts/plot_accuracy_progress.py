@@ -102,7 +102,7 @@ def main():
     for r in rows:
         if r["dev_mae_gap"] is None or r["ats_dev_roi"] is None:
             continue
-        key = (round(r["ats_dev_roi"], 6), round(r["dev_mae_gap"], 6))
+        key = (round(r["ats_dev_roi"], 4), round(r["dev_mae_gap"], 3))
         merged.setdefault(key, []).append(r)
 
     for (roi, mae), group in merged.items():
@@ -124,12 +124,17 @@ def main():
                   fontsize=12, fontweight="bold")
     ax2.grid(True, alpha=0.3, zorder=0)
 
-    # Best = smallest MAE gap, breaking the frequent exact ties (a
-    # calibration-only change moves neither ROI nor MAE) on ROI first and bet
-    # count second, so the headline names the variant actually worth keeping.
+    # Best = smallest MAE gap, breaking ties on ROI first and bet count
+    # second, so the headline names the variant actually worth keeping.
+    # Ties are frequent and must be treated as ties: a calibration-only change
+    # moves neither ROI nor MAE, and several rows share one bet universe.
+    # Rounded to 3 decimals deliberately -- a thousandth of a point of MAE is
+    # far below anything meaningful here, and comparing at full float
+    # precision let a row parsed from a 4-decimal summary.txt lose to an
+    # identical one carried at full precision from a workflow result.
     best = min(
         (r for r in rows if r["dev_mae_gap"] is not None),
-        key=lambda r: (round(r["dev_mae_gap"], 6), -(r["ats_dev_roi"] or 0), -r["ats_dev_n"]),
+        key=lambda r: (round(r["dev_mae_gap"], 3), -(r["ats_dev_roi"] or 0), -r["ats_dev_n"]),
     )
     fig.suptitle(
         f"Autoresearch sep19: accuracy and calibration against the market\n"
