@@ -641,6 +641,41 @@ TOTAL_MODEL_FEATURES = [
 RIDGE_ALPHA_MARGIN = 5.0
 RIDGE_ALPHA_TOTAL = 5.0
 
+# Tried and reverted: a PIECEWISE alpha for ridge's margin model -- a lower
+# alpha once a walk-forward fold's training pool passes some size, instead
+# of the single alpha=5.0 above for every fold regardless of how much
+# training data it has. Motivated by a diagnostic, not a hunch: refitting
+# each fold with RidgeCV (inner 5-fold CV on that fold's own training rows,
+# alphas=[0.5..35], no leakage) instead of the fixed value picks alpha=8-20
+# for every fold through 2018 (<2200 training games), 12 for 2019-2020
+# (2400-2700 games), and collapses to the floor of that grid, 0.5, for
+# every fold from 2021 on (2900+ games) -- a clean, monotonic-looking
+# pattern tied to how much data a fold actually has.
+#
+# But RidgeCV selects on MSE, and this file's own history above is proof an
+# MAE/MSE-tuned alpha does not transfer to ROI. So alpha was swept the right
+# way this time: a breakpoint in {2200, 2600, 2900, 3200} training games
+# crossed with a late-regime alpha in {0.5, 1.0, 1.5, 2.0, 3.0} (alpha=5.0
+# unchanged below the breakpoint), measured directly as DEVELOPMENT-era ATS
+# ROI (one-off walk-forward sweep script, not kept in the repo). Every one
+# of the 20 combinations landed within +0.3 to +0.4pp of the alpha=5.0-
+# always baseline's +7.81% (95% CI [+1.49%, +14.47%], a ~13pt-wide
+# interval) -- nowhere close to clearing this file's own bar of moving ROI
+# by more than the bootstrap CI width. Holdout-era ROI moved more for some
+# combinations (e.g. breakpoint=3200/late=1.0: +6.39% -> +10.07%), but per
+# the HOLDOUT_FIRST_SEASON rule above that number is NEVER the basis for a
+# keep/revert decision, and it is not here either -- recorded for
+# completeness, not as a reason to adopt this.
+#
+# Read as: the RidgeCV diagnostic is real (the amount of training data a
+# fold has really does change what regularization strength minimizes MSE),
+# but it's a second case of this file's recurring lesson -- a clean-looking
+# pattern on a proxy objective is not evidence it helps the thing that
+# actually gets bet on, at this sample size (development ATS bets per
+# season: 34-115, bootstrap CI half-width ~6-7pp). Not worth retrying
+# without a reason to believe DEVELOPMENT ROI itself moves, not just the CV
+# loss.
+
 # LightGBM is excluded from the ensemble.
 #
 # Stated honestly: this is a SIMPLIFICATION, not a measured improvement. On

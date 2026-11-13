@@ -196,6 +196,16 @@ def _impute(X, medians: dict):
     return X.fillna(medians)
 
 
+def _linear_contributions(model, X: pd.DataFrame, rows: pl.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+    """Per-game coefficient x (imputed) value for each feature, plus the
+    intercept -- the terms sum exactly to a linear model's prediction."""
+    contrib = X * model.coef_
+    contrib.columns = [f"{c}_contrib" for c in feature_cols]
+    contrib.insert(0, "game_id", rows["game_id"].to_pandas().to_numpy())
+    contrib["intercept_contrib"] = model.intercept_
+    return contrib
+
+
 def walk_forward_ridge(df: pl.DataFrame, feature_cols: list[str] | None = None) -> WalkForwardResult:
     feature_cols = feature_cols or config.MARGIN_MODEL_FEATURES
     return _walk_forward(df, feature_cols, lambda: Ridge(alpha=config.RIDGE_ALPHA_MARGIN), "ridge_baseline")
@@ -295,11 +305,7 @@ def _walk_forward(
         oof_resid.append(y_test.to_numpy() - pred)
 
         if hasattr(model, "coef_"):
-            contrib = X_test * model.coef_
-            contrib.columns = [f"{c}_contrib" for c in feature_cols]
-            contrib.insert(0, "game_id", test_df["game_id"].to_pandas().to_numpy())
-            contrib["intercept_contrib"] = model.intercept_
-            all_contribs.append(contrib)
+            all_contribs.append(_linear_contributions(model, X_test, test_df, feature_cols))
 
     predictions = pl.from_pandas(pd.concat(all_preds, ignore_index=True))
     # Scalar fallback std, now also out-of-fold: this is the honest spread of
@@ -593,6 +599,12 @@ def _predict_upcoming(
     out = upcoming.select(LIVE_MARKET_COLS).to_pandas()
     out[pred_col] = pred
     out["predicted_std"] = _fit_predict_conditional_std(std_fit_df, upcoming, std_fit_resid)
+    # Linear margin models only: the live model's per-feature breakdown, for the
+    # dashboard's "why did the model say this" on games not yet played.
+    # Carried on attrs so the prediction frame's columns stay unchanged
+    # (main.py pops it straight off again).
+    if hasattr(model, "coef_") and target_col == "home_margin":
+        out.attrs["contributions"] = _linear_contributions(model, X_test, upcoming, feature_cols)
     return out
 
 

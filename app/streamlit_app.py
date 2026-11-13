@@ -95,8 +95,11 @@ def load_skill(model: str) -> pl.DataFrame | None:
 
 
 @st.cache_data
-def load_contributions(model: str) -> pl.DataFrame | None:
-    path = config.MODEL_RESULTS_DIR / f"{model}_contributions.parquet"
+def load_contributions(model: str, upcoming: bool = False) -> pl.DataFrame | None:
+    """Backtest (walk-forward) breakdowns by default; with upcoming=True, the
+    live model's breakdowns for games not yet played (written by main.py)."""
+    suffix = "_upcoming_contributions" if upcoming else "_contributions"
+    path = config.MODEL_RESULTS_DIR / f"{model}{suffix}.parquet"
     if not path.exists():
         return None
     return pl.read_parquet(path)
@@ -119,11 +122,30 @@ def selection_edge_col(pdf: pd.DataFrame, market: str) -> str:
     reported edge gave 11 bets against the saved book's 647, and the spread
     573 against 788.
 
-    Falls back to the reported column when a parquet predates the split.
+    Falls back to the reported column when a parquet predates the split --
+    but "predates" has to be checked PER ROW, not per column. The Track
+    record tab's picks_log.parquet is one file accumulated across every
+    `--refresh` run since July via `pl.concat(..., how="diagonal_relaxed")`
+    (live_picks.append_to_picks_log); when `ats_edge_select`/`ml_edge_select`
+    were added mid-season, every row logged before that point got backfilled
+    with a NULL for it rather than dropped. A plain `preferred in pdf.columns`
+    check sees the column present (true for the whole log once any row has
+    it) and selects on it for EVERY row -- including the null ones. _bet_side
+    compares edge > threshold / edge < -threshold, both False for NaN, so
+    every pre-cutover pick silently graded as "no bet" and vanished from the
+    chart (204 picks, every one before 2026-09-20, confirmed against the
+    live log). Coalescing row-wise onto the fallback fixes it without
+    touching any caller that only ever sees fully-populated current-pipeline
+    output (load_bets, upcoming boards), where every value already exists
+    and this is a no-op.
     """
     fallback = "ats_edge" if market == "ats" else "ml_edge"
     preferred = "ats_edge_select" if market == "ats" else "ml_edge_select"
-    return preferred if preferred in pdf.columns else fallback
+    if preferred not in pdf.columns:
+        return fallback
+    if pdf[preferred].isna().any():
+        pdf[preferred] = pdf[preferred].fillna(pdf[fallback])
+    return preferred
 
 
 def pipeline_threshold_col(pdf: pd.DataFrame, market: str) -> str | None:
@@ -898,6 +920,7 @@ with tab_upcoming:
             )
 
         pdf = wk.sort("gameday").to_pandas()
+        pdf["gameday"] = pd.to_datetime(pdf["gameday"]).dt.strftime("%Y-%m-%d")
         if market == "ats":
             edge_col, prob_col, home_odds_col, away_odds_col = "ats_edge", "model_cover_prob", "home_spread_odds", "away_spread_odds"
         else:
@@ -925,7 +948,14 @@ with tab_upcoming:
             pdf["spread_line"].map(lambda v: f"{v:+.1f}") if market == "ats"
             else pdf.apply(lambda r: f"{int(r['home_moneyline']):+d} / {int(r['away_moneyline']):+d}", axis=1)
         )
-        pdf["model_number"] = pdf["predicted_margin"].map(lambda v: f"{v:+.1f}") if market == "ats" else pdf[prob_col].map(lambda v: f"{v:.0%}")
+        if market == "ats":
+            # predicted_margin uses the same sign convention as spread_line
+            # (positive = home favored) -- name the favored team instead of
+            # making the reader track the sign.
+            favored_team = np.where(pdf["predicted_margin"] >= 0, pdf["home_team"], pdf["away_team"])
+            pdf["model_number"] = [f"{t} -{abs(m):.1f}" for t, m in zip(favored_team, pdf["predicted_margin"])]
+        else:
+            pdf["model_number"] = pdf[prob_col].map(lambda v: f"{v:.0%}")
         pdf["edge_display"] = pdf[edge_col].map(lambda v: f"{v:+.1f} pts" if market == "ats" else f"{v:+.1%}")
         pdf["stake_display"] = pdf["suggested_stake_pct"].map(lambda v: f"{v:.1%}" if v > 0 else "--")
 
@@ -1239,9 +1269,19 @@ with tab_diagnostics:
 # --- Game explorer -------------------------------------------------------------
 
 with tab_explorer:
-    seasons = sorted(bets_ctx["season"].unique().to_list())
+    # Games with a posted line but no result yet, from the same board the
+    # Upcoming picks tab reads -- so a week that hasn't been played can be
+    # explored here too.
+    explorer_upcoming = load_upcoming()
+    if explorer_upcoming is not None:
+        explorer_upcoming = explorer_upcoming.filter(pl.col("model") == model)
+    else:
+        explorer_upcoming = pl.DataFrame(schema={c: pl.String for c in ["game_id", "home_team", "away_team"]} | {"season": pl.Int64, "week": pl.Int64})
+
+    seasons = sorted(set(bets_ctx["season"].unique().to_list()) | set(explorer_upcoming["season"].unique().to_list()))
     season = st.selectbox("Season", seasons, index=len(seasons) - 1)
     season_bets = bets_ctx.filter(pl.col("season") == season)
+    season_upcoming = explorer_upcoming.filter(pl.col("season") == season)
 
     st.subheader("Model vs. market, game by game")
     st.caption(
@@ -1250,72 +1290,138 @@ with tab_explorer:
         "◆ a push (stake returned), gray ● a game it sat out. (For calibration across all seasons, "
         "see the Diagnostics tab.)"
     )
-    if market == "ats":
-        fig = calibration_scatter(season_bets, "spread_line", "predicted_margin", f"{season}: model spread vs. market spread", "spread (home margin)")
+    if season_bets.height == 0:
+        st.info("No completed games yet this season -- pick an upcoming week below.")
     else:
-        fig = calibration_scatter(season_bets, "market_home_prob_no_vig", "model_home_prob", f"{season}: model home win prob vs. de-vigged market prob", "home win probability")
-    st.plotly_chart(fig, width="stretch")
+        if market == "ats":
+            fig = calibration_scatter(season_bets, "spread_line", "predicted_margin", f"{season}: model spread vs. market spread", "spread (home margin)")
+        else:
+            fig = calibration_scatter(season_bets, "market_home_prob_no_vig", "model_home_prob", f"{season}: model home win prob vs. de-vigged market prob", "home win probability")
+        st.plotly_chart(fig, width="stretch")
 
     st.subheader("Games by week")
-    weeks = sorted(season_bets["week"].unique().to_list())
-    week = st.selectbox("Week", weeks)
+    played_weeks = set(season_bets["week"].unique().to_list())
+    upcoming_weeks = set(season_upcoming["week"].unique().to_list())
+
+    def _week_label(w: int) -> str:
+        if w not in upcoming_weeks:
+            return str(w)
+        return f"{w} (upcoming)" if w not in played_weeks else f"{w} (partly upcoming)"
+
+    weeks = sorted(played_weeks | upcoming_weeks)
+    week = st.selectbox("Week", weeks, format_func=_week_label)
     week_bets = season_bets.filter(pl.col("week") == week).sort("game_id")
     week_bets = week_bets.join(load_game_scores(), on="game_id", how="left")
+    week_upcoming = season_upcoming.filter(pl.col("week") == week)
+    if week_upcoming.height > 0:
+        week_upcoming = week_upcoming.sort(["gameday", "game_id"])
 
-    wpdf = week_bets.to_pandas()
-    # nflverse's raw spread_line sign (positive = home favored) is the
-    # opposite of how a sportsbook board reads (favorite shown negative) --
-    # spell out who's favored and by how much in familiar board notation
-    # instead of making the reader convert the sign themselves.
-    fav_team = np.where(wpdf["spread_line"] > 0, wpdf["home_team"], wpdf["away_team"])
-    wpdf["favorite"] = [
-        "Pick'em" if s == 0 else f"{t} -{abs(s):.1f}" for t, s in zip(fav_team, wpdf["spread_line"])
-    ]
-    wpdf["total_points"] = wpdf["home_score"] + wpdf["away_score"]
+    def _board_favorite(frame: pd.DataFrame) -> list[str]:
+        # nflverse's raw spread_line sign (positive = home favored) is the
+        # opposite of how a sportsbook board reads (favorite shown negative) --
+        # spell out who's favored and by how much in familiar board notation
+        # instead of making the reader convert the sign themselves.
+        fav_team = np.where(frame["spread_line"] > 0, frame["home_team"], frame["away_team"])
+        return ["Pick'em" if s == 0 else f"{t} -{abs(s):.1f}" for t, s in zip(fav_team, frame["spread_line"])]
 
-    # Predicted score: the margin model already gives predicted_margin; the
-    # (separate, phase-1) totals model gives predicted_total for the SAME
-    # game. Combined algebraically (no new model needed): home = (total +
-    # margin)/2, away = (total - margin)/2. Purely a display convenience --
-    # inherits both models' own error, and the totals model isn't validated
-    # to have any real skill yet (see README's "Totals -- phase 1").
-    total_preds = load_predictions(TOTAL_MODEL_NAME[model])
-    if total_preds is not None:
-        wpdf = wpdf.merge(
-            total_preds.select(["game_id", "predicted_total"]).to_pandas(), on="game_id", how="left"
-        )
-        pred_home_score = (wpdf["predicted_total"] + wpdf["predicted_margin"]) / 2
-        pred_away_score = (wpdf["predicted_total"] - wpdf["predicted_margin"]) / 2
-        wpdf["predicted_score"] = [
-            f"{h:.0f}-{a:.0f}" if pd.notna(h) else "--" for h, a in zip(pred_home_score, pred_away_score)
-        ]
-    else:
-        wpdf["predicted_score"] = "--"
+    def _predicted_margin_display(frame: pd.DataFrame) -> list[str]:
+        # predicted_margin uses the same sign convention as spread_line
+        # (positive = home favored) -- show it the way a board would,
+        # naming which team it is rather than making the reader track the sign.
+        favored_team = np.where(frame["predicted_margin"] >= 0, frame["home_team"], frame["away_team"])
+        return [f"{t} -{abs(m):.1f}" for t, m in zip(favored_team, frame["predicted_margin"])]
+
+    def _predicted_score(frame: pd.DataFrame) -> list[str]:
+        # Predicted score: the margin model already gives predicted_margin; the
+        # (separate, phase-1) totals model gives predicted_total for the SAME
+        # game. Combined algebraically (no new model needed): home = (total +
+        # margin)/2, away = (total - margin)/2. Purely a display convenience --
+        # inherits both models' own error, and the totals model isn't validated
+        # to have any real skill yet (see README's "Totals -- phase 1").
+        if "predicted_total" not in frame:
+            return ["--"] * len(frame)
+        pred_home_score = (frame["predicted_total"] + frame["predicted_margin"]) / 2
+        pred_away_score = (frame["predicted_total"] - frame["predicted_margin"]) / 2
+        return [f"{h:.0f}-{a:.0f}" if pd.notna(h) else "--" for h, a in zip(pred_home_score, pred_away_score)]
 
     rename = {"favorite": "Favorite", "total_points": "Total points", "predicted_score": "Predicted score (H-A)"}
-    if market == "ats":
-        cols = [
-            "home_team", "away_team", "spread_line", "favorite", "predicted_margin", "ats_edge",
-            "model_cover_prob", "bet_side", "home_margin", "total_points", "predicted_score", "bet_won", "profit_units",
-        ]
-    else:
-        cols = [
-            "home_team", "away_team", "favorite", "home_moneyline", "away_moneyline",
-            "market_home_prob_no_vig", "model_home_prob", "ml_edge",
-            "bet_side", "home_margin", "total_points", "predicted_score", "bet_won", "profit_units",
-        ]
-    st.dataframe(wpdf[cols].rename(columns=rename), width="stretch", hide_index=True)
 
-    if week_bets.height == 0:
+    if week_bets.height > 0:
+        wpdf = week_bets.to_pandas()
+        wpdf["favorite"] = _board_favorite(wpdf)
+        wpdf["total_points"] = wpdf["home_score"] + wpdf["away_score"]
+        total_preds = load_predictions(TOTAL_MODEL_NAME[model])
+        if total_preds is not None:
+            wpdf = wpdf.merge(
+                total_preds.select(["game_id", "predicted_total"]).to_pandas(), on="game_id", how="left"
+            )
+        wpdf["predicted_score"] = _predicted_score(wpdf)
+        wpdf["predicted_margin"] = _predicted_margin_display(wpdf)
+
+        if market == "ats":
+            cols = [
+                "home_team", "away_team", "spread_line", "favorite", "predicted_margin", "ats_edge",
+                "model_cover_prob", "bet_side", "home_margin", "total_points", "predicted_score", "bet_won", "profit_units",
+            ]
+        else:
+            cols = [
+                "home_team", "away_team", "favorite", "home_moneyline", "away_moneyline",
+                "market_home_prob_no_vig", "model_home_prob", "ml_edge",
+                "bet_side", "home_margin", "total_points", "predicted_score", "bet_won", "profit_units",
+            ]
+        if week_upcoming.height > 0:
+            st.markdown("**Played**")
+        st.dataframe(wpdf[cols].rename(columns=rename), width="stretch", hide_index=True)
+
+    if week_upcoming.height > 0:
+        st.markdown("**Not played yet**")
+        st.caption(
+            "Numbers from the live model (trained on every completed game to date), the same ones the "
+            "Upcoming picks tab shows. Bet side uses the sidebar threshold, as there."
+        )
+        updf = week_upcoming.to_pandas()
+        updf["favorite"] = _board_favorite(updf)
+        updf["predicted_score"] = _predicted_score(updf)
+        updf["predicted_margin"] = _predicted_margin_display(updf)
+        updf["gameday"] = pd.to_datetime(updf["gameday"]).dt.strftime("%Y-%m-%d")
+        updf["bet_side"] = backtesting.decide_bet_side(
+            updf, market, effective_threshold(updf, market, threshold), edge_col=selection_edge_col(updf, market)
+        )
+        if market == "ats":
+            up_cols = [
+                "gameday", "home_team", "away_team", "spread_line", "favorite", "predicted_margin", "ats_edge",
+                "model_cover_prob", "bet_side", "predicted_score",
+            ]
+        else:
+            up_cols = [
+                "gameday", "home_team", "away_team", "favorite", "home_moneyline", "away_moneyline",
+                "market_home_prob_no_vig", "model_home_prob", "ml_edge", "bet_side", "predicted_score",
+            ]
+        st.dataframe(updf[up_cols].rename(columns=rename), width="stretch", hide_index=True)
+
+    if week_bets.height == 0 and week_upcoming.height == 0:
         st.info("No games this week.")
     else:
-        game_rows = week_bets.select(["game_id", "home_team", "away_team"]).to_dicts()
-        game_labels = {r["game_id"]: f'{r["away_team"]} @ {r["home_team"]}' for r in game_rows}
+        upcoming_ids = set(week_upcoming["game_id"].to_list())
+        game_rows = (
+            week_bets.select(["game_id", "home_team", "away_team"]).to_dicts()
+            + week_upcoming.select(["game_id", "home_team", "away_team"]).to_dicts()
+        )
+        game_labels = {
+            r["game_id"]: f'{r["away_team"]} @ {r["home_team"]}' + (" (upcoming)" if r["game_id"] in upcoming_ids else "")
+            for r in game_rows
+        }
         game_id = st.selectbox("Game", list(game_labels), format_func=lambda g: game_labels[g])
+        is_upcoming = game_id in upcoming_ids
 
         st.subheader("Why did the model say this?")
-        contributions = load_contributions(model)
-        if contributions is None:
+        contributions = load_contributions(model, upcoming=is_upcoming)
+        if contributions is None and is_upcoming and load_contributions(model) is not None:
+            st.info(
+                "No breakdown saved for upcoming games yet -- rerun the refresh (`python main.py --refresh`) "
+                "to generate one."
+            )
+        elif contributions is None:
             st.info(
                 "Per-game breakdowns are only available for the ridge_baseline model. LightGBM's predictions come "
                 "from hundreds of tree splits and don't decompose into simple additive terms the way a linear "
@@ -1324,7 +1430,11 @@ with tab_explorer:
         else:
             contrib_row = contributions.filter(pl.col("game_id") == game_id)
             if contrib_row.height == 0:
-                st.info("No breakdown saved for this game (likely outside the model's predictable seasons).")
+                st.info(
+                    "No breakdown saved for this game -- rerun the refresh to regenerate it."
+                    if is_upcoming else
+                    "No breakdown saved for this game (likely outside the model's predictable seasons)."
+                )
             else:
                 contrib_cols = [c for c in contributions.columns if c.endswith("_contrib")]
                 values = contrib_row.select(contrib_cols).to_pandas().iloc[0]
@@ -1344,7 +1454,15 @@ with tab_explorer:
                 fig.update_xaxes(gridcolor=GRID, linecolor=GRID)
                 fig.update_yaxes(gridcolor=GRID, linecolor=GRID)
                 st.plotly_chart(fig, width="stretch")
-                st.caption("Each bar is one feature's contribution (coefficient x its value for this game) to the ridge model's predicted home margin. Bars sum to the total.")
+                st.caption(
+                    "Each bar is one feature's contribution (coefficient x its value for this game) to the ridge "
+                    "model's predicted home margin. Bars sum to the total."
+                    + (
+                        " For an upcoming game this is the live model, fit on every completed game to date, so its "
+                        "coefficients differ slightly from the walk-forward fold behind that season's played games."
+                        if is_upcoming else ""
+                    )
+                )
 
         st.subheader("Games like this one")
         st.caption(

@@ -255,6 +255,14 @@ def main():
         "ridge_baseline": modeling.predict_upcoming_ridge(modeling_table, ridge_result),
         "lgbm": modeling.predict_upcoming_lgbm(modeling_table, lgbm_result),
     }
+    ridge_live = live_by_model["ridge_baseline"]
+    # Popped, not just read: a DataFrame left in attrs breaks pandas' attrs
+    # equality check in the concats/merges downstream.
+    ridge_contrib = ridge_live.attrs.pop("contributions", None) if ridge_live is not None else None
+    if ridge_contrib is not None:
+        pl.from_pandas(ridge_contrib).write_parquet(
+            config.MODEL_RESULTS_DIR / "ridge_baseline_upcoming_contributions.parquet"
+        )
     live_by_model["ensemble"] = modeling.predict_upcoming_ensemble(
         modeling_table, ridge_result, lgbm_result, live_by_model["ridge_baseline"], live_by_model["lgbm"]
     )

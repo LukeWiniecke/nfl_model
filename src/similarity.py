@@ -24,7 +24,9 @@ def find_similar_games(
     feature_cols = feature_cols or config.MARGIN_MODEL_FEATURES
     df = modeling_table.filter(pl.col("home_margin").is_not_null())
 
-    query_rows = df.filter(pl.col("game_id") == query_game_id)
+    # The query itself may be an upcoming game (no result yet) -- only the
+    # comparison pool has to be completed games.
+    query_rows = modeling_table.filter(pl.col("game_id") == query_game_id)
     if query_rows.height == 0:
         return pl.DataFrame()
     query = query_rows.row(0, named=True)
