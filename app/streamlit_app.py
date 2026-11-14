@@ -880,9 +880,24 @@ if bets_ctx is None or predictions is None:
     )
     st.stop()
 
-tab_upcoming, tab_track_record, tab_overview, tab_slices, tab_diagnostics, tab_explorer, tab_ratings, tab_sizing, tab_methodology = st.tabs(
-    ["Upcoming picks", "Track record", "Overview", "Backtest slices", "Diagnostics", "Game explorer", "Power ratings", "Bet sizing", "Methodology"]
+tab_upcoming, tab_matchup, tab_league, tab_track_record, tab_overview, tab_slices, tab_diagnostics, tab_explorer, tab_ratings, tab_sizing, tab_methodology = st.tabs(
+    ["Upcoming picks", "Matchup & trends", "League rankings", "Track record", "Overview", "Backtest slices", "Diagnostics", "Game explorer", "Power ratings", "Bet sizing", "Methodology"]
 )
+
+# --- Matchup & trends ----------------------------------------------------------
+
+with tab_matchup:
+    import matchup_tab
+
+    _mt_up = load_upcoming()
+    matchup_tab.render(
+        _mt_up.filter(pl.col("model") == model) if _mt_up is not None else None, MODEL_LABELS[model]
+    )
+
+with tab_league:
+    import matchup_tab as _mt_league
+
+    _mt_league.render_rankings()
 
 # --- Upcoming picks ------------------------------------------------------------
 
