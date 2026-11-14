@@ -19,3 +19,6 @@ results.tsv
 
 # Autoresearch sep19: machine-readable scorer output, regenerated every run
 summary.json
+
+# macOS
+.DS_Store

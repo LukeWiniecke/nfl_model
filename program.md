@@ -370,7 +370,7 @@ verdicts in `results.tsv` and let the human in the loop decide; the notes
 column must say why.
 
 **Parallel protocol.** Experiments run in detached git worktrees
-(`C:\Users\USER\nfl_wt\w0` .. `w5`), each with its own copy
+(sibling directories `nfl_wt/w0` .. `w5`), each with its own copy
 of `data/raw`, driven by the main repo's `.venv\Scripts\python.exe` with
 `OMP_NUM_THREADS=3` and `POLARS_MAX_THREADS=3`. Verified before the run: a
 worktree run is byte-identical to the main-repo run for the ensemble's ATS

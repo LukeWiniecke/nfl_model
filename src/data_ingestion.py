@@ -26,7 +26,7 @@ SEASONS = list(range(config.FIRST_SEASON, config.LAST_SEASON + 1))
 # surface. Its franchise IDs already collapse relocations to one per
 # franchise (like nflverse's own standardize_team), just spelled differently
 # for two teams.
-SPREADSPOKE_CSV_PATH = Path(r"C:\Users\USER\Downloads\spreadspoke_enhanced.csv")
+SPREADSPOKE_CSV_PATH = config.RAW_DIR / "spreadspoke_enhanced.csv"  # optional; download separately
 SPREADSPOKE_TEAM_MAP = {"LVR": "LV", "LAR": "LA"}
 
 
