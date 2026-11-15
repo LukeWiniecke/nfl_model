@@ -880,9 +880,14 @@ if bets_ctx is None or predictions is None:
     )
     st.stop()
 
-tab_upcoming, tab_matchup, tab_league, tab_track_record, tab_overview, tab_slices, tab_diagnostics, tab_explorer, tab_ratings, tab_sizing, tab_methodology = st.tabs(
-    ["Upcoming picks", "Matchup & trends", "League rankings", "Track record", "Overview", "Backtest slices", "Diagnostics", "Game explorer", "Power ratings", "Bet sizing", "Methodology"]
+tab_live, tab_upcoming, tab_matchup, tab_league, tab_track_record, tab_overview, tab_slices, tab_diagnostics, tab_explorer, tab_ratings, tab_sizing, tab_methodology = st.tabs(
+    ["Live", "Upcoming picks", "Matchup & trends", "League rankings", "Track record", "Overview", "Backtest slices", "Diagnostics", "Game explorer", "Power ratings", "Bet sizing", "Methodology"]
 )
+
+with tab_live:
+    import live_tab
+
+    live_tab.render()
 
 # --- Matchup & trends ----------------------------------------------------------
 

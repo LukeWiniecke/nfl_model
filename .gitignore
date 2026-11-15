@@ -22,3 +22,6 @@ summary.json
 
 # macOS
 .DS_Store
+
+# Live model: recorded snapshots and fitted model files (regenerate with python -m live.model / live.dist / live.ep)
+data/live/
