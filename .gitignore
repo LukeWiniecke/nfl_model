@@ -4,7 +4,10 @@ __pycache__/
 data/raw/
 data/processed/
 data/outputs/
-outputs/
+outputs/*
+# Committed so the deployed dashboard has data to show without re-running the
+# full pipeline; refresh locally and push to update the shared dashboard.
+!outputs/model_results/
 run_log.txt
 .ipynb_checkpoints/
 *.egg-info/
@@ -25,3 +28,7 @@ summary.json
 
 # Live model: recorded snapshots and fitted model files (regenerate with python -m live.model / live.dist / live.ep)
 data/live/
+
+# Local secrets (dashboard password, API keys) -- never commit, set via
+# Streamlit Community Cloud's Secrets UI in production
+.streamlit/secrets.toml

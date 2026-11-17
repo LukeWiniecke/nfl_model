@@ -803,6 +803,30 @@ def reliability_chart(df: pl.DataFrame, title: str) -> go.Figure:
 
 st.set_page_config(page_title="NFL ATS + Moneyline Model", layout="wide")
 
+
+def _check_password() -> bool:
+    """Gate the app behind a shared password, read from st.secrets["app_password"].
+
+    If no password is configured (e.g. local dev with no secrets.toml), skip the
+    gate entirely so local use is unaffected.
+    """
+    configured = st.secrets.get("app_password")
+    if not configured:
+        return True
+    if st.session_state.get("_authed"):
+        return True
+    pw = st.text_input("Password", type="password")
+    if pw and pw == configured:
+        st.session_state["_authed"] = True
+        st.rerun()
+    elif pw:
+        st.error("Wrong password.")
+    return False
+
+
+if not _check_password():
+    st.stop()
+
 st.title("NFL ATS + Moneyline Model")
 st.caption(
     "Research/backtesting dashboard, not betting advice. Walk-forward model "

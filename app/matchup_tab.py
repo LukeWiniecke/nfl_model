@@ -188,10 +188,15 @@ def render(upcoming: pl.DataFrame | None, model_label: str) -> None:
         help="Compares each game with how that opponent did in its other games that season. "
         "A good number against a strong defense counts for more than against a weak one.",
     )
-    since = c3.selectbox("Since season", seasons, index=max(len(seasons) - 2, 0), key="mt_since")
+    current_season = seasons[-1]
+    since_options = ["This season"] + seasons
+    since = c3.selectbox("Since season", since_options, index=0, key="mt_since")
     smooth = c4.slider("Rolling window (games)", 3, 12, 6, key="mt_smooth")
 
-    games = games_all.filter(pl.col("season") >= since)
+    if since == "This season":
+        games = games_all.filter(pl.col("season") == current_season)
+    else:
+        games = games_all.filter(pl.col("season") >= since)
     fig = _trend_chart(games, [(team_a, ORANGE), (team_b, BLUE)], metric, adjusted and metric != "margin", smooth)
     st.plotly_chart(fig, width="stretch")
     st.caption(
@@ -212,7 +217,8 @@ def render(upcoming: pl.DataFrame | None, model_label: str) -> None:
 
     # --- Context ---------------------------------------------------------
     st.subheader("Coaching, quarterback and recent games")
-    ctx = games_all.filter(pl.col("season") >= max(since, seasons[-1] - 2))
+    since_year = current_season if since == "This season" else since
+    ctx = games_all.filter(pl.col("season") >= max(since_year, seasons[-1] - 2))
     left, right = st.columns(2)
     with left:
         _team_context(ctx, team_a, ORANGE)
