@@ -9,6 +9,7 @@ state; any cover or win probability is then a sum over that distribution.
 
     .venv/bin/python -m live.dist            # held-out evaluation, then fit all + save
     .venv/bin/python -m live.dist --eval     # evaluation only
+    .venv/bin/python -m live.dist --fit      # fit all + save, skip evaluation
 """
 
 import sys
@@ -142,6 +143,7 @@ def get_dist():
 
 
 if __name__ == "__main__":
-    evaluate()
+    if "--fit" not in sys.argv:
+        evaluate()
     if "--eval" not in sys.argv:
         fit_and_save()

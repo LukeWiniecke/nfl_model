@@ -83,7 +83,7 @@ def _trend_chart(
     direction = "lower is better" if lower_better else "higher is better"
     adj_note = ", adjusted for opponent" if adjusted else ""
     fig.update_layout(
-        title=f"{label}{adj_note} ({direction})", height=420, legend=dict(orientation="h", y=-0.15), **LAYOUT
+        title=f"{label}{adj_note} ({direction}), {games['season'].max()} season", height=420, legend=dict(orientation="h", y=-0.15), **LAYOUT
     )
     if lower_better:
         fig.update_yaxes(autorange="reversed")
@@ -110,17 +110,9 @@ def _recent_table(games: pl.DataFrame, a: str, b: str, last_n: int) -> pd.DataFr
 def _team_context(games: pl.DataFrame, team: str, color: str) -> None:
     t = games.filter(pl.col("team") == team).sort("gameday")
     st.markdown(f"**{team}**")
-    coaches = team_trends.stints(t, "coach")
-    qbs = team_trends.stints(t, "qb")
-    if coaches.height:
-        st.caption("Head coach (consecutive stints in this window)")
-        st.dataframe(coaches.to_pandas(), width="stretch", hide_index=True)
-    if qbs.height:
-        st.caption("Starting quarterback (consecutive stints)")
-        st.dataframe(qbs.to_pandas(), width="stretch", hide_index=True)
     st.caption("Most recent games")
     last = t.tail(8).select(
-        pl.col("gameday").alias("Date"),
+        pl.col("gameday").dt.strftime("%Y-%m-%d").alias("Date"),
         pl.when(pl.col("is_home")).then(pl.lit("vs")).otherwise(pl.lit("@")).alias(""),
         pl.col("opponent").alias("Opp"),
         pl.concat_str(pl.col("points_for").cast(pl.Int64), pl.lit("-"), pl.col("points_against").cast(pl.Int64)).alias("Score"),
@@ -178,7 +170,7 @@ def render(upcoming: pl.DataFrame | None, model_label: str) -> None:
 
     # --- Controls --------------------------------------------------------
     seasons = sorted(games_all["season"].unique().to_list())
-    c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+    c1, c2, c3 = st.columns([3, 2, 3])
     metric_keys = list(team_trends.METRICS)
     metric = c1.selectbox(
         "Metric", metric_keys, format_func=lambda k: team_trends.METRICS[k][0], key="mt_metric"
@@ -188,15 +180,9 @@ def render(upcoming: pl.DataFrame | None, model_label: str) -> None:
         help="Compares each game with how that opponent did in its other games that season. "
         "A good number against a strong defense counts for more than against a weak one.",
     )
-    current_season = seasons[-1]
-    since_options = ["This season"] + seasons
-    since = c3.selectbox("Since season", since_options, index=0, key="mt_since")
-    smooth = c4.slider("Rolling window (games)", 3, 12, 6, key="mt_smooth")
+    smooth = c3.slider("Rolling window (games)", 3, 12, 6, key="mt_smooth")
 
-    if since == "This season":
-        games = games_all.filter(pl.col("season") == current_season)
-    else:
-        games = games_all.filter(pl.col("season") >= since)
+    games = games_all.filter(pl.col("season") == seasons[-1])  # current season only
     fig = _trend_chart(games, [(team_a, ORANGE), (team_b, BLUE)], metric, adjusted and metric != "margin", smooth)
     st.plotly_chart(fig, width="stretch")
     st.caption(
@@ -216,14 +202,12 @@ def render(upcoming: pl.DataFrame | None, model_label: str) -> None:
     )
 
     # --- Context ---------------------------------------------------------
-    st.subheader("Coaching, quarterback and recent games")
-    since_year = current_season if since == "This season" else since
-    ctx = games_all.filter(pl.col("season") >= max(since_year, seasons[-1] - 2))
+    st.subheader("Recent games")
     left, right = st.columns(2)
     with left:
-        _team_context(ctx, team_a, ORANGE)
+        _team_context(games_all, team_a, ORANGE)
     with right:
-        _team_context(ctx, team_b, BLUE)
+        _team_context(games_all, team_b, BLUE)
 
 
 def render_rankings() -> None:
