@@ -810,7 +810,10 @@ def _check_password() -> bool:
     If no password is configured (e.g. local dev with no secrets.toml), skip the
     gate entirely so local use is unaffected.
     """
-    configured = st.secrets.get("app_password")
+    try:
+        configured = st.secrets.get("app_password")
+    except Exception:  # no secrets.toml at all (local dev): st.secrets raises instead of returning None
+        configured = None
     if not configured:
         return True
     if st.session_state.get("_authed"):
