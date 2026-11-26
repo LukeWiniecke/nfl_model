@@ -1,8 +1,35 @@
 # Live model status (update as things change)
 
-Last updated: 2026-11-25
+Last updated: 2026-11-26
 
-## Walk-forward Brier, 2021-2026 (lower better), after the leaf-size fix (2026-11-25)
+## v2 win-prob model (2026-11-26): walk-forward Brier 2021-2026 (lower better)
+| Time left | Brownian | v1 blend | **v2** | nflfastR wp | vegas_wp |
+|---|---|---|---|---|---|
+| Q1 | 0.2068 | 0.2034 | **0.2019** | 0.2334 | 0.2015 |
+| Q2 | 0.1797 | 0.1751 | **0.1726** | 0.1928 | 0.1725 |
+| Q3 | 0.1450 | 0.1412 | **0.1409** | 0.1492 | 0.1402 |
+| Q4 early | 0.1153 | 0.1114 | **0.1102** | 0.1127 | 0.1091 |
+| Last 5 min | 0.1055 | 0.0881 | **0.0846** | 0.0850 | 0.0825 |
+| All | 0.1588 | 0.1533 | **0.1516** | 0.1665 | 0.1509 |
+
+Gap to vegas_wp: 0.0024 -> 0.0007. What v2 changed:
+- **2nd-half kickoff receiver** as a feature (an extra possession; nflfastR has it, v1 didn't). Helped Q1-Q2.
+- **Possession-perspective classifier** with nflfastR-style inputs (spread fading as exp(-4 x elapsed), score differential scaled up as time runs out, monotone in down / distance / field position / timeouts), handed over linearly from kickoff to halftime from the remaining-margin regressor. Helped everything after halftime, most in the last 5 minutes.
+- The v1 late-game classifier never gets weight in this handoff, so it was dropped.
+
+Tried on held-out 2022-25 (train <= 2021) and NOT adopted:
+| Idea | Result |
+|---|---|
+| Extra inputs in the possession model (EP, total, spread) | worse (0.1544 -> 0.1557) |
+| Training on 1999-2021 instead of 2010-2021 | late game better, first half worse (era drift); net worse; recency weighting didn't fix it |
+| Late-game features (clock the leader can burn, scores needed, possessions left, overtime flag) | ~0 (0.1539 -> 0.1538) |
+| Dedicated late-game model (last 20 min, smaller leaves) | slightly worse |
+| Calibration layer per time bucket (Platt / isotonic, fit 2018-21) | worse: home-field advantage drifted, so the correction didn't transfer |
+| Different early/late handoff windows | no effect |
+| In-game EPA so far | no effect |
+Reference only: averaging v2 with vegas_wp beats vegas_wp alone (0.1534 vs 0.1535 held out), so v2 carries some information nflfastR's model lacks.
+
+## Older: walk-forward Brier after the leaf-size fix (2026-11-25)
 | Time left | Brownian | Learned | Classifier | Blend | nflfastR wp | vegas_wp |
 |---|---|---|---|---|---|---|
 | Q1 | 0.2068 | 0.2034 | 0.2074 | 0.2034 | 0.2334 | 0.2015 |
@@ -68,4 +95,5 @@ Multiclass LightGBM over integer remaining margin (+/-28). Used for SPREAD prici
 - 2026-11-15: added EP feature (`ep_home`, `eff_lead`), refit model. Remaining bias: punting situations still ~1 pt too high for the punting team.
 - 2026-11-15: added margin-distribution model and a fair live spread ladder in the Live tab (centred on the 50/50 line). Checked Q4 behaviour by score: model's mean remaining margin is within ~0.5 pt per lead bucket, but the gaussian sd was 10-25% too narrow late, which motivated this.
 - 2026-11-24: weekly refresh failed (no network after wake, DNS errors); refresh script now retries 6x and refits the live models.
+- 2026-11-26: v2 win-prob model (2nd-half kickoff receiver + possession classifier from halftime); live model refit.
 - 2026-11-25: built `totals.py`. Found and fixed game memorisation in all LightGBM models (leaf size), refit live models. `score_states` split out of `score_snapshots` (identical output on 1,708 recorded snapshots). Checked in-game EPA features (held-out nflverse seasons): no gain.

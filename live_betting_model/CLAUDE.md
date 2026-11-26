@@ -25,10 +25,10 @@ Run everything with `.venv/bin/python` from the repo root.
 
 ## Model
 - Target: final home margin. Prior = **pregame** closing spread (never the live line; it leaks the score).
-- Early game: LightGBM predicts remaining margin (final minus current), Normal around it. Last 15 minutes: blend linearly (over 10 min) into a direct LightGBM win classifier, because the Gaussian misses clock mechanics.
+- Win probability (v2): at kickoff a LightGBM remaining-margin model (Normal around it); it hands over linearly by halftime to a LightGBM win classifier from the offense's point of view with nflfastR-style inputs (spread fading with time, score differential scaled up as time runs out, monotone in down/distance/field position/timeouts). Both know which team receives the 2nd-half kickoff (live: inferred from the opening possession; unknown -> averaged over both).
 - Validation: walk-forward by season (train on earlier seasons), regular season only, 2021-2026 test. Never split by play; plays within a game are correlated.
-- **Leaf size matters:** a game is ~150 plays, so small LightGBM leaves can be a handful of games, and game-constant inputs (pregame spread/total) let the trees memorise those games. Shared settings live in `baseline.py` (`MIN_LEAF` = 3000 plays, monotone constraints on lead/spread/EP); `dist.py` and `totals.py` use the same leaf size. Keep it when adding features.
-- Brier by time left (lower better): see `STATUS.md` for the current table. Benchmark to beat is nflfastR `vegas_wp`; we are close but behind, mainly in the last 5 minutes.
+- **Leaf size matters:** a game is ~150 plays, so small LightGBM leaves can be a handful of games, and game-constant inputs (pregame spread/total) let the trees memorise those games. Shared settings live in `baseline.py` (`MIN_LEAF` = 3000 plays for models with game-constant inputs; the possession classifier has none and uses `POS_LEAF` = 300); `dist.py` and `totals.py` use 3000. Re-check on held-out seasons when adding features.
+- Brier by time left (lower better): see `STATUS.md` for the current table. Benchmark to beat is nflfastR `vegas_wp`; v2 is 0.0007 behind overall, level in the first half, behind mainly in the last 5 minutes. STATUS.md also lists what was tried and rejected; check it before re-trying an idea.
 - Fair line = -(lead + predicted remaining margin), home-positive convention below.
 - Spread prices come from `dist.py` (full distribution: key numbers, skew, late-game width), not from the Gaussian. Win probability and spread ladder are two models and can disagree slightly; that is known.
 

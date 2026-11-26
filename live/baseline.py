@@ -38,6 +38,30 @@ def clf_params(cols) -> dict:
     return dict(LGB_BASE, n_estimators=400, min_child_samples=MIN_LEAF, monotone_constraints=[MONO_CLF.get(c, 0) for c in cols])
 
 
+# ---- v2 win-prob model (2026-11-26) ---------------------------------------------------------
+# Early game: the remaining-margin regressor, now told who receives the 2nd-half kickoff (an extra
+# possession). From kickoff to halftime it hands over linearly to a classifier from the offense's
+# point of view with nflfastR-style time-scaled features. Held out 2022-25 (train <= 2021):
+# Brier 0.1555 -> 0.1539 (nflfastR vegas_wp 0.1535); first half now level with vegas_wp.
+REG_FEATS = FEATS + ["home_rec2h"]
+POS_FEATS = ["pos_rec2h", "spread_time", "pos_home", "half_t", "t", "diff_time_ratio", "pos_lead", "down",
+             "ydstogo", "yardline_100", "pos_to", "def_to"]
+# a worse down / distance / field position or more opponent timeouts can only hurt the offense
+MONO_POS = {"pos_rec2h": 1, "spread_time": 1, "diff_time_ratio": 1, "pos_lead": 1, "down": -1, "ydstogo": -1,
+            "yardline_100": -1, "pos_to": 1, "def_to": -1}
+POS_LEAF = 300   # no game-constant inputs here, so smaller leaves don't memorise games (held-out check)
+HANDOFF = (3600, 1800)  # seconds left: regressor only at kickoff -> possession classifier only from halftime
+
+
+def pos_params(cols) -> dict:
+    return dict(LGB_BASE, n_estimators=600, min_child_samples=POS_LEAF, monotone_constraints=[MONO_POS.get(c, 0) for c in cols])
+
+
+def handoff_weight(t):
+    hi, lo = HANDOFF
+    return np.clip((hi - np.asarray(t, float)) / (hi - lo), 0, 1)
+
+
 def load() -> "pl.DataFrame":
     d = pl.read_parquet(PATH).filter(
         pl.col("spread_line").is_not_null() & pl.col("score_differential").is_not_null() & pl.col("result").is_not_null() & pl.col("posteam").is_not_null()
@@ -57,6 +81,11 @@ def load() -> "pl.DataFrame":
         home_vwp=pl.when(pl.col("posteam") == pl.col("home_team")).then(pl.col("vegas_wp")).otherwise(1 - pl.col("vegas_wp")),
         win=(pl.col("result") > 0).cast(pl.Int8),
     ).with_columns(y_rem=pl.col("result") - pl.col("lead")).with_columns(exp_rem_brown=pl.col("spread") * pl.col("t") / 3600)
+    # who receives the 2nd-half kickoff (the first 3rd-quarter kickoff's receiving team); known all game
+    rec = (d.filter((pl.col("qtr") == 3) & (pl.col("play_type") == "kickoff")).sort("play_id")
+            .group_by("game_id").agg(rec2h=pl.col("posteam").first()))
+    d = d.join(rec, on="game_id", how="left").with_columns(
+        home_rec2h=pl.when(pl.col("qtr") <= 2).then((pl.col("rec2h") == pl.col("home_team")).cast(pl.Float64)))
     return d.filter(pl.col("result") != 0)
 
 
@@ -68,47 +97,49 @@ def brier(p, y): return float(np.mean((p - y) ** 2))
 
 
 def main():
+    import pandas as pd
     from .ep import add_ep
+    from .model import add_features
     d = add_ep(load().to_pandas())
     d["q"] = bucket(d["t"].values)
     out = []
     for season in sorted(d.season.unique())[-6:]:
-        tr, te = d[d.season < season], d[d.season == season].copy()
+        tr, te = d[d.season < season].copy(), d[d.season == season].copy()
         # 1. Brownian: sigma from training remaining-margin residuals
         res = tr.y_rem - tr.exp_rem_brown
         sig = float(np.sqrt((res**2 / (tr.t / 3600)).mean()))
         te["p_brown"] = norm.cdf((te.lead + te.exp_rem_brown) / (sig * np.sqrt(te.t / 3600)))
-        # 2. learned remaining-margin model
-        m = lgb.LGBMRegressor(**reg_params(FEATS))
-        m.fit(tr[FEATS], tr.y_rem)
-        r = tr.y_rem - m.predict(tr[FEATS])
-        tr_b = (r**2 / np.maximum(tr.t / 3600, 0.02)).mean() ** 0.5
-        mu = m.predict(te[FEATS])
-        te["p_learn"] = norm.cdf((te.lead + mu) / (tr_b * np.sqrt(np.maximum(te.t / 3600, 0.02))))
-        # 3. direct win classifier: learns clock/possession/timeout effects the
-        #    Gaussian can't (kneel-downs, two-score games, hurry-up)
-        for df in (tr, te):
-            df["pos_lead"] = np.where(df.pos_home == 1, df.lead, -df.lead)
-            df["z"] = (df.lead + df.exp_rem_brown) / (sig * np.sqrt(df.t / 3600))
-            df["home_to"] = np.where(df.pos_home == 1, df.pos_to, df.def_to)
-            df["away_to"] = np.where(df.pos_home == 1, df.def_to, df.pos_to)
-            df["pos_spread"] = np.where(df.pos_home == 1, df.spread, -df.spread)
-        c = lgb.LGBMClassifier(**clf_params(CF))
-        c.fit(tr[CF], tr.win)
+        tr, te = add_features(tr, sig), add_features(te, sig)
+        # 2. learned remaining-margin model (v1 features / v2 features with the 2nd-half kickoff receiver)
+        def learned(feats):
+            m = lgb.LGBMRegressor(**reg_params(feats)).fit(tr[feats], tr.y_rem)
+            r = tr.y_rem - m.predict(tr[feats])
+            b = (r**2 / np.maximum(tr.t / 3600, 0.02)).mean() ** 0.5
+            return norm.cdf((te.lead + m.predict(te[feats])) / (b * np.sqrt(np.maximum(te.t / 3600, 0.02))))
+        te["p_learn"] = learned(FEATS)
+        p_learn2 = learned(REG_FEATS)
+        # 3. v1: direct win classifier, blended in over the last 15 min
+        c = lgb.LGBMClassifier(**clf_params(CF)).fit(tr[CF], tr.win)
         te["p_clf"] = c.predict_proba(te[CF])[:, 1]
-        w = np.clip((900 - te.t) / 600, 0, 1)  # learned-margin early, classifier in the last 15 min
+        w = np.clip((900 - te.t) / 600, 0, 1)
         te["p_blend"] = (1 - w) * te.p_learn + w * te.p_clf
+        # 4. v2: possession classifier, handed over from kickoff to halftime
+        pos = lgb.LGBMClassifier(**pos_params(POS_FEATS)).fit(tr[POS_FEATS], np.where(tr.pos_home == 1, tr.win, 1 - tr.win))
+        pp = pos.predict_proba(te[POS_FEATS])[:, 1]
+        w2 = handoff_weight(te.t)
+        te["p_v2"] = (1 - w2) * p_learn2 + w2 * np.where(te.pos_home == 1, pp, 1 - pp)
         out.append(te)
-    o = np.concatenate([x.assign(_=0).values for x in out]) if False else __import__("pandas").concat(out)
+    o = pd.concat(out)
     o = o.dropna(subset=["home_wp", "home_vwp"])
-    rows = []
-    for q, g in o.groupby("q"):
-        rows.append((q, len(g), brier(g.p_brown, g.win), brier(g.p_learn, g.win), brier(g.p_clf, g.win), brier(g.p_blend, g.win), brier(g.home_wp, g.win), brier(g.home_vwp, g.win)))
-    rows.sort(key=lambda r: ["Q1", "Q2", "Q3", "Q4 early", "last 5 min"].index(r[0]))
-    print(f"Brier (lower better), test seasons {int(o.season.min())}-{int(o.season.max())}")
-    print(f"{'bucket':<11}{'plays':>8}{'brownian':>10}{'learned':>9}{'clf':>8}{'blend':>8}{'nfl wp':>8}{'vegas wp':>9}")
-    for r in rows: print(f"{r[0]:<11}{r[1]:>8}" + "".join(f"{x:>10.4f}" if i == 0 else f"{x:>9.4f}" for i, x in enumerate(r[2:])))
-    print("ALL        ", f"{len(o):>8}", *[f"{brier(o[c], o.win):.4f}" for c in ("p_brown", "p_learn", "p_clf", "p_blend", "home_wp", "home_vwp")])
+    cols = [("brownian", "p_brown"), ("learned", "p_learn"), ("v1 blend", "p_blend"), ("v2", "p_v2"),
+            ("nfl wp", "home_wp"), ("vegas wp", "home_vwp")]
+    order = ["Q1", "Q2", "Q3", "Q4 early", "last 5 min"]
+    print(f"Brier (lower better), test seasons {int(o.season.min())}-{int(o.season.max())}, walk-forward by season")
+    print(f"{'bucket':<11}{'plays':>8}" + "".join(f"{n:>10}" for n, _ in cols))
+    for q in order:
+        g = o[o.q == q]
+        print(f"{q:<11}{len(g):>8}" + "".join(f"{brier(g[c], g.win):>10.4f}" for _, c in cols))
+    print(f"{'ALL':<11}{len(o):>8}" + "".join(f"{brier(o[c], o.win):>10.4f}" for _, c in cols))
 
 
 if __name__ == "__main__":

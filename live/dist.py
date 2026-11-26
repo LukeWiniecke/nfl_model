@@ -58,7 +58,8 @@ def mean_final(p: np.ndarray, lead) -> np.ndarray:
 
 
 def evaluate():
-    from .model import add_features, CF
+    from .baseline import CF
+    from .model import add_features
     d = add_ep(load().to_pandas())
     d["exp_rem_brown"] = d.spread * d.t / 3600
     tr, te = d[d.season < 2024], d[d.season >= 2024].copy()
