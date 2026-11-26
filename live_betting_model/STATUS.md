@@ -63,6 +63,24 @@ outcome classes), in-game offensive efficiency (EPA/play, success rate: 0.5865 -
 Takeaway: on history the game state explains only a little more of remaining scoring; the decision
 effects are real but mostly matter in the last 5-10 minutes.
 
+## Team tendencies (2026-11-26): tested, NOT adopted
+`live/tendencies.py` builds leakage-free pregame tendencies per team from nflverse play-by-play, in
+neutral states (Q1-Q3, score within 10): pace (seconds between snaps), no-huddle rate, pass rate over
+expected, go-for-it rate on 4th-and-3-or-less from midfield in, 2-point tries per TD. Running average of
+prior games only, shrunk to the league, older seasons down-weighted. Sanity: most aggressive entering
+2025 wk 10 were PHI/BUF/IND (82-87% go rate), least MIN (43%).
+League drift is large: go-for-it rate 28-33% (2010-15) -> 57-71% (2020-26); 2-point tries doubled.
+Held out 2022-25 (train <= 2021), best variant of each:
+| Model | Without | + raw tendencies | + tendencies relative to league-to-date |
+|---|---|---|---|
+| Win prob (Brier) | **0.1539** | 0.1566 | 0.1549 |
+| Totals (O/U log loss) | **0.5872** | 0.5896 | 0.5880 |
+Eight variants (raw / era-relative, game-level / offense-vs-defense, leaves 300-10000) all lost. The
+models lean on tendencies in training (42% of totals' split gain) but it does not carry to later seasons:
+a style profile is close to a team fingerprint, so trees learn team-season quirks beyond the spread.
+Raw values also confound style with quality (early adopters of 4th-down aggression were good teams).
+The module is kept for analysis; no model uses it.
+
 ## Totals model v1 (`live/totals.py`), held out 2022-2025
 - Remaining-points distribution vs a pace-based Gaussian: over/under log loss 0.5097 vs 0.5428 (8 lines around the expected total); final-total MAE 7.18 vs 7.32 pts.
 
@@ -112,6 +130,7 @@ Multiclass LightGBM over integer remaining margin (+/-28). Used for SPREAD prici
 - 2026-11-15: added EP feature (`ep_home`, `eff_lead`), refit model. Remaining bias: punting situations still ~1 pt too high for the punting team.
 - 2026-11-15: added margin-distribution model and a fair live spread ladder in the Live tab (centred on the 50/50 line). Checked Q4 behaviour by score: model's mean remaining margin is within ~0.5 pt per lead bucket, but the gaussian sd was 10-25% too narrow late, which motivated this.
 - 2026-11-24: weekly refresh failed (no network after wake, DNS errors); refresh script now retries 6x and refits the live models.
+- 2026-11-26: team tendency features (pace, no-huddle, PROE, 4th-down and 2-point aggressiveness) tested for totals and win prob: worse on held-out seasons, not adopted.
 - 2026-11-26: totals v2 (game-script/decision features + tempo).
 - 2026-11-26: v2 win-prob model (2nd-half kickoff receiver + possession classifier from halftime); live model refit.
 - 2026-11-25: built `totals.py`. Found and fixed game memorisation in all LightGBM models (leaf size), refit live models. `score_states` split out of `score_snapshots` (identical output on 1,708 recorded snapshots). Checked in-game EPA features (held-out nflverse seasons): no gain.
