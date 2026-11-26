@@ -17,6 +17,11 @@ v2 (2026-11-26) adds the decisions that change scoring as a game develops:
 Held out 2022-25 (train <= 2021): over/under log loss 0.5874 -> 0.5865, last 5 minutes
 0.3366 -> 0.3270, calibration of late over/under probabilities still ~1.0.
 
+Scoring is anchored to the pregame total (score_states_totals): at kickoff the model's non-weather
+disagreement with the line is pure noise (slope 0.04 on 1,084 held-out games), so it is removed and the
+removal fades as the game goes on; only the wind and rain/snow adjustment is kept (the line already
+prices domes and temperature). O/U log loss 0.5868 -> 0.5856.
+
     .venv/bin/python -m live.totals            # held-out evaluation, then fit all + save
     .venv/bin/python -m live.totals --eval     # evaluation only
     .venv/bin/python -m live.totals --fit      # fit all + save
@@ -168,7 +173,44 @@ def evaluate():
     print(f"{'all':>7}{n:>8}{tot[0]/n:>15.4f}{tot[1]/n:>14.4f}")
 
 
-def score_states_totals(d: pd.DataFrame, model=None) -> np.ndarray:
+def shift_pmf(P: np.ndarray, s: np.ndarray) -> np.ndarray:
+    """Shift each row's remaining-points distribution by s points (fractional shifts mix the two
+    neighbouring integer shifts; mass pushed past 0 or 75 stays at the end)."""
+    F = np.cumsum(P, axis=1)
+    j = np.arange(P.shape[1])[None, :]
+    lo = np.floor(s).astype(int)[:, None]
+    frac = (s - np.floor(s))[:, None]
+
+    def F_at(idx):
+        return np.where(idx < 0, 0.0, np.take_along_axis(F, np.clip(idx, 0, P.shape[1] - 1), axis=1))
+
+    Fn = (1 - frac) * F_at(j - lo) + frac * F_at(j - lo - 1)
+    Fn[:, -1] = 1.0
+    return np.diff(np.concatenate([np.zeros((len(P), 1)), Fn], axis=1), axis=1)
+
+
+def kickoff_noise(model: dict, spread, total, indoor, temp_f) -> np.ndarray:
+    """The model's expected final total at a standard kickoff state, minus the pregame total, with the
+    game's roof and temperature but typical wind (8 mph outdoors) and no rain/snow. On held-out seasons
+    this deviation predicts nothing (slope 0.04 over 1,084 games; the pregame line already prices domes
+    and temperature), so it is removed at kickoff (see score_states_totals). What remains is the model's
+    wind and rain/snow adjustment, which the pregame line under-prices."""
+    key = pd.DataFrame({"spread": np.asarray(spread, float), "total": np.asarray(total, float),
+                        "indoor": np.asarray(indoor, float), "temp_f": np.asarray(temp_f, float)})
+    uniq = key.drop_duplicates().reset_index(drop=True)
+    outs = []
+    for ph in (0.0, 1.0):  # kickoff: possession averaged
+        k = pd.DataFrame({"t": 3600.0, "half_t": 1800.0, "qtr": 1.0, "cur_total": 0.0, "lead": 0.0,
+                          "spread": uniq.spread, "total": uniq.total, "pos_home": ph, "down": np.nan, "ydstogo": 0.0,
+                          "yardline_100": 35.0, "pos_to": 3.0, "def_to": 3.0, "plays_so_far": 0.0,
+                          "indoor": uniq.indoor, "temp_f": uniq.temp_f, "wind_mph": np.where(uniq.indoor == 1, 0.0, 8.0),
+                          "rain": 0.0, "snow": 0.0})
+        outs.append(pmf(model, curve_features(base_features(k), model["curve"])) @ RT)
+    uniq["noise"] = np.mean(outs, axis=0) - uniq.total
+    return key.merge(uniq, on=["spread", "total", "indoor", "temp_f"], how="left").noise.values
+
+
+def score_states_totals(d: pd.DataFrame, model=None, anchor: bool = True) -> np.ndarray:
     """Remaining-points distribution for canonical game-state rows (same columns as
     model.score_states, plus optional plays_so_far = snaps with a down 1-4 so far).
     Returns (n, 76) over RT."""
@@ -195,6 +237,18 @@ def score_states_totals(d: pd.DataFrame, model=None) -> np.ndarray:
     P = pmf(model, build(d.pos_home))
     if (~d.stable).any():
         P = np.where(d.stable.values[:, None], P, (P + pmf(model, build(1 - d.pos_home))) / 2)
+    if anchor:
+        # Anchor to the pregame total: remove the model's kickoff deviation except its wind and rain/snow
+        # adjustment, fading like nflfastR's spread term (exp(-4 x elapsed share): 37% left after Q1, 14% at
+        # halftime). Held out 2022-25: O/U log loss 0.5868 -> 0.5856, Q1 better, rain/snow games
+        # 0.5626 -> 0.5594, indoor games no longer bumped over the line.
+        t = seconds_left(d.period.fillna(0), d.clock_sec.fillna(0))
+        fade = np.exp(-4 * np.clip((3600 - t) / 3600, 0, 1))
+        from .weather import DEFAULTS
+        indoor = d["indoor"].astype(float).fillna(DEFAULTS["indoor"]).values if "indoor" in d else np.full(len(d), DEFAULTS["indoor"])
+        temp = d["temp_f"].astype(float).fillna(DEFAULTS["temp_f"]).values if "temp_f" in d else np.full(len(d), DEFAULTS["temp_f"])
+        noise = kickoff_noise(model, d.spread_prior.values, d.total.fillna(45.0).values, indoor, temp)
+        P = shift_pmf(P, -noise * fade)
     return P
 
 

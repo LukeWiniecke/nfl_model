@@ -206,12 +206,24 @@ def score_snapshots(df: pd.DataFrame, prior: pd.Series | None = None) -> pd.Data
     d["line_spread"] = [spread_line_from_details(a, b, h) for a, b, h in zip(d.spread_details, d.spread, d.home)]
     d["spread_prior"] = d.game_id.map(prior) if prior is not None else d.line_spread
     d["spread_prior"] = d.spread_prior.fillna(d.line_spread).fillna(0.0)
+    # ESPN drops odds once a game starts, so in-game rows have no total: carry the pregame total forward
+    # (both models use it; a missing total used to fall back to a flat 45)
+    d["total"] = d.total.fillna(d.game_id.map(pregame_total(d)))
     d["stable"] = d.possession.map(lambda v: isinstance(v, str)) & d.down.between(1, 4) & d.ydl.notna()
     d["home_rec2h"] = d.game_id.map(second_half_receiver(d))
     p, mu, P = score_states(d, m)
     d.loc[~d.stable, ["down", "distance", "ydl"]] = np.nan
     d["pmf"] = list(P)  # distribution over remaining margin (live.dist.REM), for spread pricing
     d["dist_margin"] = mean_final(P, d.lead)
+    # live totals: kickoff weather per game + snaps so far, then the remaining-points distribution
+    from .totals import RT, score_states_totals
+    wx = d.groupby("game_id").apply(_game_weather, include_groups=False)
+    for c in ("indoor", "temp_f", "wind_mph", "rain", "snow", "weather_source"):
+        d[c] = d.game_id.map({g: w.get(c) for g, w in wx.items()})
+    d["plays_so_far"] = _snaps_so_far(d)
+    PT = score_states_totals(d)
+    d["pmf_tot"] = list(PT)
+    d["exp_total"] = d.home_score + d.away_score + PT @ RT
     final = d.state == "post"
     p = np.where(final, (d.lead > 0).astype(float) + 0.5 * (d.lead == 0), p)
     d["p_model"] = p
@@ -221,6 +233,47 @@ def score_snapshots(df: pd.DataFrame, prior: pd.Series | None = None) -> pd.Data
     d["p_line"] = norm.cdf(live_final / (m["sig"] * np.sqrt(np.maximum(d.t, 1) / 3600)).clip(lower=0.5))
     d["gap"] = d.p_model - d.p_line
     return d
+
+
+_weather_by_game: dict = {}
+
+
+def _game_weather(g: pd.DataFrame) -> dict:
+    """Kickoff weather for one game's snapshots (fetched once per game per process)."""
+    gid = g.name if hasattr(g, "name") else None
+    g = g.sort_values("ts")
+    # venue info from the latest row that has it (older snapshots predate these fields)
+    has_venue = g[g.indoor.notna()] if "indoor" in g else g.iloc[0:0]
+    key = (gid, len(has_venue) > 0)
+    if key in _weather_by_game:
+        return _weather_by_game[key]
+    from datetime import datetime, timezone
+    from .weather import DEFAULTS, live_conditions
+    first = has_venue.iloc[-1] if len(has_venue) else g.iloc[0]
+    ko = first.get("kickoff") if "kickoff" in g else None
+    try:
+        kickoff = datetime.fromisoformat(str(ko).replace("Z", "+00:00")) if isinstance(ko, str) else \
+            datetime.fromisoformat(str(g[g.state == "in"].ts.min() if (g.state == "in").any() else first.ts)).astimezone(timezone.utc)
+        w = live_conditions(kickoff, indoor=first.get("indoor") if "indoor" in g else None, home_team=first.home,
+                            city=first.get("venue_city") if "venue_city" in g else None,
+                            state=first.get("venue_state") if "venue_state" in g else None,
+                            country=first.get("venue_country") if "venue_country" in g else None)
+    except Exception:
+        w = dict(DEFAULTS, source="defaults (weather unavailable)")
+    w["weather_source"] = w.pop("source", "")
+    _weather_by_game[key] = w
+    return w
+
+
+def _snaps_so_far(d: pd.DataFrame) -> pd.Series:
+    """Snaps already run before each snapshot: new down-1-4 situations seen so far minus the current one."""
+    out = pd.Series(np.nan, index=d.index)
+    for _, g in d.sort_values("ts").groupby("game_id"):
+        k = g[["period", "home_score", "away_score", "down", "distance", "ydl"]].astype(float).fillna(-999)
+        k["possession"] = g.possession.astype(str)
+        new = k.ne(k.shift()).any(axis=1) & g.down.between(1, 4)
+        out[g.index] = (new.cumsum() - 1).clip(lower=0).values
+    return out
 
 
 def second_half_receiver(d: pd.DataFrame) -> pd.Series:
@@ -253,6 +306,16 @@ def pregame_prior(df: pd.DataFrame) -> pd.Series:
         row = pre.iloc[-1] if len(pre) else g.iloc[0]
         out[gid] = spread_line_from_details(row.spread_details, row.spread, row.home)
     return pd.Series(out)
+
+
+def pregame_total(df: pd.DataFrame) -> pd.Series:
+    """Per game: the last posted total seen before kickoff (else the first one seen)."""
+    out = {}
+    for gid, g in df.sort_values("ts").groupby("game_id"):
+        tot = g.total.dropna() if "total" in g else pd.Series(dtype=float)
+        pre = g.loc[tot.index][g.loc[tot.index].state == "pre"].total if len(tot) else tot
+        out[gid] = float(pre.iloc[-1]) if len(pre) else (float(tot.iloc[0]) if len(tot) else np.nan)
+    return pd.Series(out, dtype=float)
 
 
 if __name__ == "__main__":

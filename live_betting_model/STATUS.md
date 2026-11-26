@@ -63,6 +63,29 @@ outcome classes), in-game offensive efficiency (EPA/play, success rate: 0.5865 -
 Takeaway: on history the game state explains only a little more of remaining scoring; the decision
 effects are real but mostly matter in the last 5-10 minutes.
 
+## Totals: anchored to the pregame total (2026-11-26), ADOPTED
+At kickoff the totals model drifts from the pregame total by +/-2.3 pts and that drift predicts nothing
+(1,084 held-out games: slope of (final - line) on (model - line) = 0.04; games the model had 3+ under
+went 3 over). Only rain/snow leans were real (model -1.2, actual -3.0). Fix at scoring time: remove the
+model's kickoff deviation except its wind and rain/snow adjustment, fading as exp(-4 x elapsed share)
+(37% left after Q1, 14% at halftime; a slower fade by share of scoring left hurt Q3-Q4).
+| Held out 2022-25 | v3 | keep all weather | keep no weather | **keep wind + rain/snow** |
+|---|---|---|---|---|
+| All plays | 0.5868 | 0.5858 | 0.5852 | **0.5856** |
+| Rain/snow games | 0.5626 | 0.5595 | 0.5647 | **0.5594** |
+| Indoor games | - | 0.5885 | 0.5873 | **0.5873** |
+The line already prices domes and temperature; wind and rain on the day are what it under-prices.
+
+## Live weather source (2026-11-26)
+ESPN's scoreboard has no wind speed, so live kickoff weather comes from Open-Meteo (free, no key; only a
+city's coordinates and a date are sent; cached in data/live/weather_cache.json). Calibrated on 363 outdoor
+home games 2024-25 against nflverse: temperature corr 0.99 (used as is); wind corr 0.76 but reads low in
+windy games, so nflverse ~= 2.54 + 0.75 x Open-Meteo; wet = kickoff-hour precipitation >= 0.3 mm (95%
+agreement; weather codes alone gave 44 false alarms). Venue: ESPN city/state (neutral sites), else the
+home team's city; ESPN's indoor flag zeroes wind/precip.
+Also fixed: ESPN drops odds once a game starts, so live in-game rows had no total and both models fell
+back to a flat 45; the pregame total is now carried forward.
+
 ## Totals v3 (2026-11-26): kickoff weather, ADOPTED
 `live/weather.py`: roof type, temperature and wind from the nflverse schedule; rain/snow parsed from the
 play-by-play weather description (about 7% of games). Held out 2022-25 (train <= 2021):
@@ -143,6 +166,8 @@ Multiclass LightGBM over integer remaining margin (+/-28). Used for SPREAD prici
 - 2026-11-15: added EP feature (`ep_home`, `eff_lead`), refit model. Remaining bias: punting situations still ~1 pt too high for the punting team.
 - 2026-11-15: added margin-distribution model and a fair live spread ladder in the Live tab (centred on the 50/50 line). Checked Q4 behaviour by score: model's mean remaining margin is within ~0.5 pt per lead bucket, but the gaussian sd was 10-25% too narrow late, which motivated this.
 - 2026-11-24: weekly refresh failed (no network after wake, DNS errors); refresh script now retries 6x and refits the live models.
+- 2026-11-26: totals anchored to the pregame total at kickoff; live weather from Open-Meteo (calibrated);
+  live Live-tab total ladder; in-game rows now keep the pregame total (was a flat 45).
 - 2026-11-26: totals v3 = v2 + kickoff weather (live/weather.py).
 - 2026-11-26: team tendency features (pace, no-huddle, PROE, 4th-down and 2-point aggressiveness) tested for totals and win prob: worse on held-out seasons, not adopted.
 - 2026-11-26: totals v2 (game-script/decision features + tempo).

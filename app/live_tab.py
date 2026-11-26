@@ -51,6 +51,23 @@ def _chart(g: pd.DataFrame, home: str) -> go.Figure:
     return fig
 
 
+def total_ladder(pmf_tot, cur_total: float, n: int = 4) -> pd.DataFrame:
+    """Fair over/under prices for half-point totals around the model's 50/50 total."""
+    import numpy as np
+    from live.totals import RT
+    from src.utils import prob_to_american
+    P = np.asarray(pmf_tot, dtype=float)
+    final = cur_total + RT
+    cand = np.arange(int(cur_total), int(cur_total) + 80) + 0.5
+    center = cand[np.argmin([abs(float(P[final > k].sum()) - 0.5) for k in cand])]
+    rows = []
+    for k in center + np.arange(-n, n + 1):
+        po = min(max(float(P[final > k].sum()), 0.001), 0.999)
+        rows.append({"Total": k, "P(over)": po, "Fair over": int(prob_to_american(np.array([po]))[0]),
+                     "P(under)": 1 - po, "Fair under": int(prob_to_american(np.array([1 - po]))[0])})
+    return pd.DataFrame(rows)
+
+
 @st.fragment(run_every=15)
 def _body() -> None:
     s = _scored()
@@ -95,6 +112,15 @@ def _body() -> None:
                      hide_index=True, width="stretch")
         st.caption("Compare a book's live spread price with the fair odds on the same line. Prices account for key "
                    "numbers (3, 7) and game script; they do not know about injuries or anything not in the game state.")
+
+        st.markdown(f"**Fair live total ladder** (model's remaining-points distribution; no vig) - expected final total "
+                    f"{r.exp_total:.1f}")
+        st.dataframe(total_ladder(r.pmf_tot, r.home_score + r.away_score).style.format(
+            {"P(over)": "{:.1%}", "P(under)": "{:.1%}", "Fair over": "{:+d}", "Fair under": "{:+d}"}),
+            hide_index=True, width="stretch")
+        wx = ("indoors" if r.indoor == 1 else f"{r.temp_f:.0f}F, wind {r.wind_mph:.0f} mph"
+              + (", rain" if r.rain == 1 else "") + (", snow" if r.snow == 1 else ""))
+        st.caption(f"Kickoff weather used by the totals model: {wx} ({r.weather_source}).")
 
     # Moves of the posted line during play tell us whether it is really live.
     n_lines = g.line_margin.nunique()

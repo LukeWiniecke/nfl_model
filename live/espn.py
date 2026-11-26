@@ -64,4 +64,11 @@ def parse_event(ev: dict, ts: str) -> dict:
         "total": odds.get("overUnder"),
         "home_ml": (odds.get("homeTeamOdds") or {}).get("moneyLine"),
         "away_ml": (odds.get("awayTeamOdds") or {}).get("moneyLine"),
+        # venue + kickoff for the kickoff-weather lookup (live/weather.py); ESPN has no wind speed
+        "kickoff": ev.get("date"),
+        "venue_city": ((comp.get("venue") or {}).get("address") or {}).get("city"),
+        "venue_state": ((comp.get("venue") or {}).get("address") or {}).get("state"),
+        "venue_country": ((comp.get("venue") or {}).get("address") or {}).get("country"),
+        "indoor": (comp.get("venue") or {}).get("indoor"),
+        "espn_weather": (ev.get("weather") or comp.get("weather") or {}).get("displayValue"),
     }

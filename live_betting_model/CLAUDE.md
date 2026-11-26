@@ -15,7 +15,7 @@ Keep it simple: estimate how odds should shift as plays progress. Model P(home w
 | `ep.py` | Expected points for the offense, distilled from nflfastR `ep` using only live-available inputs. Adds `ep_home`, `eff_lead`. |
 | `dist.py` | Multiclass model of the full remaining-margin distribution; `prob_final_gt` gives cover probability for any line, `ladder` builds the fair spread ladder. Saved to `data/live/dist.joblib`. |
 | `totals.py` | Multiclass model of the remaining total points (0-75) with game-script/decision features, tempo and a learned scoring curve (saved with the model); `prob_over` prices any total. Callers may pass `plays_so_far` (snaps with a down 1-4 so far); otherwise it is estimated from the clock. Saved to `data/live/totals.joblib`. |
-| `weather.py` | Kickoff weather per game from nflverse (indoor, temp, wind, rain/snow) for the totals model. Live: ESPN scoreboard has indoor/temp/conditions but no wind. |
+| `weather.py` | Kickoff weather per game: nflverse for training (indoor, temp, wind, rain/snow); live from Open-Meteo kickoff-hour conditions calibrated to nflverse's scale (`live_conditions`), with ESPN's indoor flag and venue city. |
 | `tendencies.py` | Leakage-free pregame team tendencies (pace, no-huddle, PROE, 4th-down/2-point aggressiveness) from nflverse. Tested as model inputs and rejected (see STATUS.md); kept for analysis. |
 | `baseline.py` | Walk-forward evaluation: Brownian, learned margin, direct classifier, blend vs nflfastR `wp`/`vegas_wp`. Run `python -m live.baseline`. |
 | `model.py` | Final model fit on all seasons -> `data/live/model.joblib`; `score_snapshots` turns snapshot rows into probabilities. |
@@ -32,6 +32,7 @@ Run everything with `.venv/bin/python` from the repo root.
 - **Leaf size matters:** a game is ~150 plays, so small LightGBM leaves can be a handful of games, and game-constant inputs (pregame spread/total) let the trees memorise those games. Shared settings live in `baseline.py` (`MIN_LEAF` = 3000 plays for models with game-constant inputs; the possession classifier has none and uses `POS_LEAF` = 300); `dist.py` and `totals.py` use 3000. Re-check on held-out seasons when adding features.
 - Brier by time left (lower better): see `STATUS.md` for the current table. Benchmark to beat is nflfastR `vegas_wp`; v2 is 0.0007 behind overall, level in the first half, behind mainly in the last 5 minutes. STATUS.md also lists what was tried and rejected; check it before re-trying an idea.
 - Fair line = -(lead + predicted remaining margin), home-positive convention below.
+- Totals are anchored to the pregame total at kickoff (the model's own kickoff disagreement is noise, except wind and rain/snow) and the anchor fades as exp(-4 x elapsed share). Keep this when changing the totals model.
 - Spread prices come from `dist.py` (full distribution: key numbers, skew, late-game width), not from the Gaussian. Win probability and spread ladder are two models and can disagree slightly; that is known.
 
 ## Conventions and gotchas
