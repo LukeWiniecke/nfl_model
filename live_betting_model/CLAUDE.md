@@ -14,7 +14,7 @@ Keep it simple: estimate how odds should shift as plays progress. Model P(home w
 | `states.py` | Builds `data/raw/nflverse/pbp_states.parquet` (793k plays, 28 cols; the main pipeline's pbp cache has only 18 and cannot be used). |
 | `ep.py` | Expected points for the offense, distilled from nflfastR `ep` using only live-available inputs. Adds `ep_home`, `eff_lead`. |
 | `dist.py` | Multiclass model of the full remaining-margin distribution; `prob_final_gt` gives cover probability for any line, `ladder` builds the fair spread ladder. Saved to `data/live/dist.joblib`. |
-| `totals.py` | Multiclass model of the remaining total points (0-75); `prob_over` prices any total. Saved to `data/live/totals.joblib`. |
+| `totals.py` | Multiclass model of the remaining total points (0-75) with game-script/decision features, tempo and a learned scoring curve (saved with the model); `prob_over` prices any total. Callers may pass `plays_so_far` (snaps with a down 1-4 so far); otherwise it is estimated from the clock. Saved to `data/live/totals.joblib`. |
 | `baseline.py` | Walk-forward evaluation: Brownian, learned margin, direct classifier, blend vs nflfastR `wp`/`vegas_wp`. Run `python -m live.baseline`. |
 | `model.py` | Final model fit on all seasons -> `data/live/model.joblib`; `score_snapshots` turns snapshot rows into probabilities. |
 | `monitor.py` | Terminal table (`python -m live.monitor`). |

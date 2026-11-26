@@ -1,10 +1,19 @@
 """Live TOTALS: full distribution of the points still to be scored.
 
-A multiclass LightGBM predicts P(remaining total points = r) for r = 0..75 from
-the game state (time, current total, pregame total and spread, score margin,
-possession and field position). P(over k) is then a sum over that
-distribution, which handles the lumpiness of scoring (3s and 7s) and the
-slower pace of blowouts and late leads.
+A multiclass LightGBM predicts P(remaining total points = r) for r = 0..75 from the game
+state; P(over k) is a sum over that distribution, which handles the lumpiness of scoring
+(3s and 7s).
+
+v2 (2026-11-26) adds the decisions that change scoring as a game develops:
+  - game script: margin from the offense's view, how many scores the trailing side needs,
+    garbage time, leader / trailer with the ball late, two-minute drills, clock the leader
+    can burn, both teams' timeouts, overtime;
+  - each team's implied points from the pregame lines;
+  - the real shape of scoring through a game (bumps before halftime and at the end) instead
+    of a straight line, learned from the training seasons and saved with the model;
+  - tempo: plays per minute so far (counted the way the live feed counts snaps).
+Held out 2022-25 (train <= 2021): over/under log loss 0.5874 -> 0.5865, last 5 minutes
+0.3366 -> 0.3270, calibration of late over/under probabilities still ~1.0.
 
     .venv/bin/python -m live.totals            # held-out evaluation, then fit all + save
     .venv/bin/python -m live.totals --eval     # evaluation only
@@ -24,57 +33,108 @@ import polars as pl
 from scipy.stats import norm
 
 from .baseline import MIN_LEAF, PATH, load
-from .ep import get_ep_model, EP_FEATS
+from .ep import EP_FEATS, get_ep_model
 
 TOT_PATH = Path(__file__).resolve().parents[1] / "data/live/totals.joblib"
+VERSION = 2
 CLIP = 75
 RT = np.arange(0, CLIP + 1)  # class i <-> remaining points RT[i]
-TF = ["t", "half_t", "qtr", "cur_total", "lead", "abs_lead", "spread", "total", "pos_home", "down", "ydstogo",
-      "yardline_100", "pos_to", "def_to", "ep_off", "exp_rem_tot", "pace"]
+BASE = ["t", "half_t", "qtr", "cur_total", "lead", "abs_lead", "spread", "total", "pos_home", "down", "ydstogo",
+        "yardline_100", "pos_to", "def_to", "ep_off", "exp_rem_tot", "pace"]
+SCRIPT = ["off_imp", "def_imp", "pos_lead", "f_t", "exp_rem_curve", "garbage", "leader_ball_late", "trailer_ball_late",
+          "two_min", "burn_margin", "need", "home_to", "away_to", "is_ot"]
+TEMPO = ["tempo", "plays_so_far", "pts_per_play"]
+TF = BASE + SCRIPT + TEMPO
+PLAYS_PER_MIN = 2.45  # league-typical snaps (downs 1-4) per game minute: fallback when the count is unknown
 PARAMS = dict(objective="multiclass", num_class=len(RT), n_estimators=120, learning_rate=0.08, num_leaves=15,
               min_child_samples=MIN_LEAF, subsample=0.6, subsample_freq=1, colsample_bytree=0.8, verbose=-1)
 
 
-def add_total_features(d: pd.DataFrame) -> pd.DataFrame:
-    """Needs t, half_t, qtr, cur_total (PRE-play), lead, spread, total (pregame line),
-    pos_home, down, ydstogo, yardline_100, pos_to, def_to."""
+def base_features(d: pd.DataFrame) -> pd.DataFrame:
+    """Needs t, half_t, qtr, cur_total (PRE-play), lead, spread, total (pregame line), pos_home,
+    down, ydstogo, yardline_100, pos_to, def_to, plays_so_far (snaps with a down 1-4 so far)."""
     d = d.copy()
     d["abs_lead"] = d.lead.abs()
-    ep_in = d[EP_FEATS].astype(float)
-    d["ep_off"] = get_ep_model().predict(ep_in)  # value of the current drive to the offense
+    d["ep_off"] = get_ep_model().predict(d[EP_FEATS].astype(float))  # value of the current drive to the offense
     d["exp_rem_tot"] = d.total * d.t / 3600
-    d["pace"] = d.cur_total - d.total * (3600 - d.t) / 3600  # points above/below the pregame pace
+    d["pace"] = d.cur_total - d.total * (3600 - d.t) / 3600          # points above/below the pregame pace
+    d["home_imp"], d["away_imp"] = (d.total + d.spread) / 2, (d.total - d.spread) / 2
+    d["off_imp"] = np.where(d.pos_home == 1, d.home_imp, d.away_imp)
+    d["def_imp"] = np.where(d.pos_home == 1, d.away_imp, d.home_imp)
+    d["pos_lead"] = np.where(d.pos_home == 1, d.lead, -d.lead)
+    d["garbage"] = ((d.abs_lead >= 17) & (d.t <= 900)).astype(float)
+    d["leader_ball_late"] = ((d.pos_lead > 0) & (d.t <= 300)).astype(float)
+    d["trailer_ball_late"] = ((d.pos_lead < 0) & (d.t <= 300)).astype(float)
+    d["two_min"] = (d.half_t <= 120).astype(float)
+    downs_left = np.where(d.down.between(1, 4), 5 - d.down, 4)
+    d["burn_margin"] = d.t - np.maximum(downs_left * 40 - d.def_to * 40, 0)   # <= 0: leader with the ball can kneel out
+    d["need"] = np.select([d.pos_lead > 16, d.pos_lead > 8, d.pos_lead > 3, d.pos_lead > 0, d.pos_lead == 0,
+                           d.pos_lead >= -3, d.pos_lead >= -8, d.pos_lead >= -16], [4, 3, 2, 1, 0, -1, -2, -3], -4)
+    d["home_to"] = np.where(d.pos_home == 1, d.pos_to, d.def_to)
+    d["away_to"] = np.where(d.pos_home == 1, d.def_to, d.pos_to)
+    d["is_ot"] = (d.qtr >= 5).astype(float)
+    elapsed_min = (3600 - d.t) / 60
+    if "plays_so_far" not in d or d.plays_so_far.isna().all():
+        d["plays_so_far"] = np.round(elapsed_min * PLAYS_PER_MIN)
+    d["plays_so_far"] = d.plays_so_far.fillna(np.round(elapsed_min * PLAYS_PER_MIN))
+    d["tempo"] = d.plays_so_far / np.maximum(elapsed_min, 3)
+    d["pts_per_play"] = d.cur_total / np.maximum(d.plays_so_far, 10)
+    return d
+
+
+def scoring_curve(d: pd.DataFrame) -> pd.Series:
+    """Share of the pregame total still to come, by minute of game time left (training rows)."""
+    b = np.digitize(d.t, np.arange(0, 3660, 60))
+    return d.y_rem_tot.groupby(b).sum() / d.total.groupby(b).sum()
+
+
+def curve_features(d: pd.DataFrame, curve: pd.Series) -> pd.DataFrame:
+    d = d.copy()
+    b = np.digitize(d.t, np.arange(0, 3660, 60))
+    d["f_t"] = pd.Series(b, index=d.index).map(curve).fillna(d.t / 3600)
+    d["exp_rem_curve"] = d.total * d.f_t
     return d
 
 
 def training_frame() -> pd.DataFrame:
-    """baseline.load() rows plus the PRE-play total and the final total.
+    """baseline.load() rows plus the PRE-play total, the final total and the snap count so far.
     (load() overwrites nflverse `total`, the final total, with the pregame line.)"""
     raw = (pl.read_parquet(PATH).sort(["game_id", "play_id"])
-           .with_columns(post=pl.col("total_home_score") + pl.col("total_away_score"))
-           .with_columns(cur_total=pl.col("post").shift(1).over("game_id").fill_null(0))
-           .select("game_id", "play_id", "cur_total", final_total=pl.col("total")))
+           .with_columns(post=pl.col("total_home_score") + pl.col("total_away_score"),
+                         snap=pl.col("down").is_between(1, 4).fill_null(False).cast(pl.Int32))
+           .with_columns(cur_total=pl.col("post").shift(1).over("game_id").fill_null(0),
+                         plays_so_far=pl.col("snap").cum_sum().shift(1).over("game_id").fill_null(0))
+           .select("game_id", "play_id", "cur_total", "plays_so_far", final_total=pl.col("total")))
     d = load().join(raw, on=["game_id", "play_id"], how="left").to_pandas()
     d = d[d.final_total.notna() & d.cur_total.notna()]
     d["y_rem_tot"] = d.final_total - d.cur_total
     d = d[d.y_rem_tot >= 0]
-    return add_total_features(d)
+    return base_features(d)
 
 
-def _fit(d: pd.DataFrame) -> lgb.LGBMClassifier:
-    y = np.clip(np.rint(d.y_rem_tot), 0, CLIP).astype(int)
+def _fit(d: pd.DataFrame) -> dict:
+    curve = scoring_curve(d)
+    X = curve_features(d, curve)
+    y = np.clip(np.rint(X.y_rem_tot), 0, CLIP).astype(int)
     assert len(np.unique(y)) == len(RT), "a remaining-points class is missing from training data"
-    return lgb.LGBMClassifier(**PARAMS).fit(d[TF], y)
+    return dict(clf=lgb.LGBMClassifier(**PARAMS).fit(X[TF], y), curve=curve, version=VERSION)
 
 
-def pmf(model, X: pd.DataFrame) -> np.ndarray:
-    return model.predict_proba(X[TF])
+def pmf(model: dict, X: pd.DataFrame) -> np.ndarray:
+    if "f_t" not in X:
+        X = curve_features(X, model["curve"])
+    return model["clf"].predict_proba(X[TF])
 
 
 def prob_over(P: np.ndarray, cur_total, k: float, push: float = 0.0) -> np.ndarray:
     """P(final total > k) (+ push * P(final total == k))."""
     final = np.asarray(cur_total, dtype=float)[:, None] + RT[None, :]
     return (P * ((final > k) + push * (final == k))).sum(axis=1)
+
+
+def _over_rowwise(P: np.ndarray, cur_total: np.ndarray, k: np.ndarray) -> np.ndarray:
+    final = cur_total[:, None] + RT[None, :]
+    return (P * (final > k[:, None])).sum(axis=1)
 
 
 def evaluate():
@@ -103,7 +163,8 @@ def evaluate():
 
 def score_states_totals(d: pd.DataFrame, model=None) -> np.ndarray:
     """Remaining-points distribution for canonical game-state rows (same columns as
-    model.score_states). Returns (n, 76) over RT."""
+    model.score_states, plus optional plays_so_far = snaps with a down 1-4 so far).
+    Returns (n, 76) over RT."""
     from .model import half_seconds_left, seconds_left
     model = model if model is not None else get_totals()
     d = d.copy()
@@ -118,19 +179,15 @@ def score_states_totals(d: pd.DataFrame, model=None) -> np.ndarray:
             "yardline_100": d.ydl,
             "pos_to": np.where(pos_home == 1, d.home_timeouts, d.away_timeouts),
             "def_to": np.where(pos_home == 1, d.away_timeouts, d.home_timeouts),
+            "plays_so_far": d["plays_so_far"] if "plays_so_far" in d else np.nan,
         }).astype(float)
         X[["pos_to", "def_to"]] = X[["pos_to", "def_to"]].fillna(3.0)
-        return add_total_features(X)
+        return curve_features(base_features(X), model["curve"])
 
     P = pmf(model, build(d.pos_home))
     if (~d.stable).any():
         P = np.where(d.stable.values[:, None], P, (P + pmf(model, build(1 - d.pos_home))) / 2)
     return P
-
-
-def _over_rowwise(P: np.ndarray, cur_total: np.ndarray, k: np.ndarray) -> np.ndarray:
-    final = cur_total[:, None] + RT[None, :]
-    return (P * (final > k[:, None])).sum(axis=1)
 
 
 def fit_and_save():
@@ -143,9 +200,11 @@ _cache: dict = {}
 
 def get_totals():
     if "m" not in _cache:
-        if not TOT_PATH.exists():
+        m = joblib.load(TOT_PATH) if TOT_PATH.exists() else None
+        if not isinstance(m, dict) or m.get("version") != VERSION:
             fit_and_save()
-        _cache["m"] = joblib.load(TOT_PATH)
+            m = joblib.load(TOT_PATH)
+        _cache["m"] = m
     return _cache["m"]
 
 

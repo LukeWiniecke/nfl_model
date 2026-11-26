@@ -46,7 +46,24 @@ Test set now includes 2026 through week 11, so vegas_wp moved too; compare gaps:
 - Win-prob blend: Brier 0.1561 -> 0.1554 (checkpoint rows 0.1618 -> 0.1613) with MIN_LEAF 3000 + monotone constraints. Dropping the total hurt (0.1562); nflfastR-style exponential spread decay added nothing.
 - Margin distribution: cover log loss 0.5928 -> 0.5908, win Brier 0.1576 -> 0.1562 (min leaf 300 -> 3000).
 
-## Totals model (`live/totals.py`), held out 2022-2025
+## Totals v2 (2026-11-26): decisions and game script, held out 2022-25 (train <= 2021)
+Diagnosis of v1 (mean final total minus expected, points): leader with the ball late -> model 0.3-0.6
+too HIGH (clock-killing); slow-tempo games -> ~0.5 too high after halftime; first half 0.5-1.4 too low.
+| Variant | CRPS | O/U log loss | Q1 | Q3 | Last 5 min | Late calibration slope |
+|---|---|---|---|---|---|---|
+| v1 | 5.034 | 0.5874 | **0.6563** | 0.6177 | 0.3366 | 1.00 |
+| + game script / decision features | 5.040 | 0.5873 | 0.6604 | **0.6158** | 0.3272 | 1.00 |
+| **v2 = + tempo (snaps per minute so far)** | **5.031** | **0.5865** | 0.6594 | 0.6164 | **0.3270** | 1.01 |
+Decision features: offense-view margin, scores the trailer needs, garbage time, leader/trailer with the
+ball late, two-minute drills, clock the leader can burn, both teams' timeouts, overtime, implied team
+points from the pregame lines, the real scoring curve (end-of-half bumps). Live callers pass the number
+of snaps so far from their game feed; otherwise it is estimated from the clock.
+Rejected: more trees/leaves (overfits: 0.5980), dedicated late-game model (small leaves collapse with 76
+outcome classes), in-game offensive efficiency (EPA/play, success rate: 0.5865 -> 0.5863, not worth it).
+Takeaway: on history the game state explains only a little more of remaining scoring; the decision
+effects are real but mostly matter in the last 5-10 minutes.
+
+## Totals model v1 (`live/totals.py`), held out 2022-2025
 - Remaining-points distribution vs a pace-based Gaussian: over/under log loss 0.5097 vs 0.5428 (8 lines around the expected total); final-total MAE 7.18 vs 7.32 pts.
 
 ## Live-market comparison
@@ -95,5 +112,6 @@ Multiclass LightGBM over integer remaining margin (+/-28). Used for SPREAD prici
 - 2026-11-15: added EP feature (`ep_home`, `eff_lead`), refit model. Remaining bias: punting situations still ~1 pt too high for the punting team.
 - 2026-11-15: added margin-distribution model and a fair live spread ladder in the Live tab (centred on the 50/50 line). Checked Q4 behaviour by score: model's mean remaining margin is within ~0.5 pt per lead bucket, but the gaussian sd was 10-25% too narrow late, which motivated this.
 - 2026-11-24: weekly refresh failed (no network after wake, DNS errors); refresh script now retries 6x and refits the live models.
+- 2026-11-26: totals v2 (game-script/decision features + tempo).
 - 2026-11-26: v2 win-prob model (2nd-half kickoff receiver + possession classifier from halftime); live model refit.
 - 2026-11-25: built `totals.py`. Found and fixed game memorisation in all LightGBM models (leaf size), refit live models. `score_states` split out of `score_snapshots` (identical output on 1,708 recorded snapshots). Checked in-game EPA features (held-out nflverse seasons): no gain.
