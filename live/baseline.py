@@ -17,6 +17,25 @@ from scipy.stats import norm
 PATH = Path(__file__).resolve().parents[1] / "data/raw/nflverse/pbp_states.parquet"
 FEATS = ["t", "lead", "spread", "total", "pos_home", "down", "ydstogo", "yardline_100",
          "pos_to", "def_to", "half_t", "qtr", "exp_rem_brown", "ep_home", "eff_lead"]
+CF = FEATS + ["pos_lead", "z", "home_to", "away_to", "pos_spread"]
+
+# Shared LightGBM settings for the win-prob blend (live model, backtest and this eval).
+# MIN_LEAF: a game is ~150 plays, so the old 100-200-play leaves could be a handful of
+# games, and game-constant features (pregame spread/total) let trees memorise those
+# games' outcomes (e.g. a 55.5 total moved one home team's expected margin by 4.6 pts).
+# ~3000 plays = dozens of games per leaf. Held out 2022-25: Brier 0.1561 -> 0.1554.
+LGB_BASE = dict(learning_rate=0.03, num_leaves=31, subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1)
+MIN_LEAF = 3000
+MONO_REG = {"spread": 1, "exp_rem_brown": 1, "ep_home": 1}  # remaining home margin rises with these
+MONO_CLF = {"lead": 1, "spread": 1, "exp_rem_brown": 1, "ep_home": 1, "eff_lead": 1, "z": 1}
+
+
+def reg_params(cols) -> dict:
+    return dict(LGB_BASE, n_estimators=300, min_child_samples=MIN_LEAF, monotone_constraints=[MONO_REG.get(c, 0) for c in cols])
+
+
+def clf_params(cols) -> dict:
+    return dict(LGB_BASE, n_estimators=400, min_child_samples=MIN_LEAF, monotone_constraints=[MONO_CLF.get(c, 0) for c in cols])
 
 
 def load() -> "pl.DataFrame":
@@ -60,8 +79,7 @@ def main():
         sig = float(np.sqrt((res**2 / (tr.t / 3600)).mean()))
         te["p_brown"] = norm.cdf((te.lead + te.exp_rem_brown) / (sig * np.sqrt(te.t / 3600)))
         # 2. learned remaining-margin model
-        m = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.03, num_leaves=31, min_child_samples=200,
-                              subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1)
+        m = lgb.LGBMRegressor(**reg_params(FEATS))
         m.fit(tr[FEATS], tr.y_rem)
         r = tr.y_rem - m.predict(tr[FEATS])
         tr_b = (r**2 / np.maximum(tr.t / 3600, 0.02)).mean() ** 0.5
@@ -75,9 +93,7 @@ def main():
             df["home_to"] = np.where(df.pos_home == 1, df.pos_to, df.def_to)
             df["away_to"] = np.where(df.pos_home == 1, df.def_to, df.pos_to)
             df["pos_spread"] = np.where(df.pos_home == 1, df.spread, -df.spread)
-        CF = FEATS + ["pos_lead", "z", "home_to", "away_to", "pos_spread"]
-        c = lgb.LGBMClassifier(n_estimators=400, learning_rate=0.03, num_leaves=31, min_child_samples=100,
-                               subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1)
+        c = lgb.LGBMClassifier(**clf_params(CF))
         c.fit(tr[CF], tr.win)
         te["p_clf"] = c.predict_proba(te[CF])[:, 1]
         w = np.clip((900 - te.t) / 600, 0, 1)  # learned-margin early, classifier in the last 15 min

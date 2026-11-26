@@ -1,8 +1,31 @@
 # Live model status (update as things change)
 
-Last updated: 2026-11-15
+Last updated: 2026-11-25
 
-## Walk-forward Brier, 2021-2026 (lower better), after the pre-play score fix
+## Walk-forward Brier, 2021-2026 (lower better), after the leaf-size fix (2026-11-25)
+| Time left | Brownian | Learned | Classifier | Blend | nflfastR wp | vegas_wp |
+|---|---|---|---|---|---|---|
+| Q1 | 0.2068 | 0.2034 | 0.2074 | 0.2034 | 0.2334 | 0.2015 |
+| Q2 | 0.1797 | 0.1751 | 0.1783 | 0.1751 | 0.1928 | 0.1725 |
+| Q3 | 0.1450 | 0.1412 | 0.1443 | 0.1412 | 0.1492 | 0.1402 |
+| Q4 early | 0.1153 | 0.1108 | 0.1132 | 0.1114 | 0.1127 | 0.1091 |
+| Last 5 min | 0.1055 | 0.0902 | 0.0881 | 0.0881 | 0.0850 | 0.0825 |
+| All | 0.1588 | 0.1534 | 0.1561 | 0.1533 | 0.1665 | 0.1509 |
+
+Test set now includes 2026 through week 11, so vegas_wp moved too; compare gaps: blend - vegas_wp = +0.0024 (was +0.0028).
+
+## Leaf-size / memorisation fix (2026-11-25), held out 2022-2025 (train <= 2021)
+- Old leaves (100-200 plays) could be a few games; the pregame total then moved one team's expected margin by 4.6 pts (DAL-SF, total 55.5).
+- Win-prob blend: Brier 0.1561 -> 0.1554 (checkpoint rows 0.1618 -> 0.1613) with MIN_LEAF 3000 + monotone constraints. Dropping the total hurt (0.1562); nflfastR-style exponential spread decay added nothing.
+- Margin distribution: cover log loss 0.5928 -> 0.5908, win Brier 0.1576 -> 0.1562 (min leaf 300 -> 3000).
+
+## Totals model (`live/totals.py`), held out 2022-2025
+- Remaining-points distribution vs a pace-based Gaussian: over/under log loss 0.5097 vs 0.5428 (8 lines around the expected total); final-total MAE 7.18 vs 7.32 pts.
+
+## Live-market comparison
+- Results that depend on confidential market data are kept in gitignored private notes, not here.
+
+## Older: walk-forward Brier after the pre-play score fix (2026-11-15)
 | Time left | Brownian | Learned | Classifier | Blend | nflfastR wp | vegas_wp |
 |---|---|---|---|---|---|---|
 | Q1 | 0.2072 | 0.2051 | 0.2100 | 0.2051 | 0.2337 | 0.2028 |
@@ -44,3 +67,5 @@ Multiclass LightGBM over integer remaining margin (+/-28). Used for SPREAD prici
 - 2026-11-15: first live game recorded. Found and fixed: (1) training used `total_home_score - total_away_score`, which is POST-play, so points scored on the play were already in the lead (FG value invisible; user spotted the 4th-down-in-FG-range bias). Now uses pre-play `score_differential`. (2) NaN possession was treated as a team in `yardline_100`. (3) between-play rows caused probability blips. Model refit.
 - 2026-11-15: added EP feature (`ep_home`, `eff_lead`), refit model. Remaining bias: punting situations still ~1 pt too high for the punting team.
 - 2026-11-15: added margin-distribution model and a fair live spread ladder in the Live tab (centred on the 50/50 line). Checked Q4 behaviour by score: model's mean remaining margin is within ~0.5 pt per lead bucket, but the gaussian sd was 10-25% too narrow late, which motivated this.
+- 2026-11-24: weekly refresh failed (no network after wake, DNS errors); refresh script now retries 6x and refits the live models.
+- 2026-11-25: built `totals.py`. Found and fixed game memorisation in all LightGBM models (leaf size), refit live models. `score_states` split out of `score_snapshots` (identical output on 1,708 recorded snapshots). Checked in-game EPA features (held-out nflverse seasons): no gain.

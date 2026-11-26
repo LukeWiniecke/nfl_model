@@ -16,11 +16,10 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm
 
-from .baseline import FEATS, load
+from .baseline import CF, FEATS, clf_params, load, reg_params
 from .ep import add_ep
 
 MODEL_PATH = Path(__file__).resolve().parents[1] / "data/live/model.joblib"
-CF = FEATS + ["pos_lead", "z", "home_to", "away_to", "pos_spread"]
 
 
 def add_features(d: pd.DataFrame, sig: float) -> pd.DataFrame:
@@ -34,17 +33,23 @@ def add_features(d: pd.DataFrame, sig: float) -> pd.DataFrame:
     return d
 
 
-def fit_and_save() -> dict:
-    d = add_ep(load().to_pandas())
+def fit_win_models(d: pd.DataFrame) -> dict:
+    """Fit the win-probability blend on a training frame from baseline.load()
+    (+ add_ep). Shared by the live model and the leakage-free backtest model."""
+    d = d.copy()
     d["exp_rem_brown"] = d.spread * d.t / 3600
     sig = float(np.sqrt(((d.y_rem - d.exp_rem_brown) ** 2 / (d.t / 3600)).mean()))
     d = add_features(d, sig)
-    kw = dict(learning_rate=0.03, num_leaves=31, subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1)
-    reg = lgb.LGBMRegressor(n_estimators=300, min_child_samples=200, **kw).fit(d[FEATS], d.y_rem)
-    clf = lgb.LGBMClassifier(n_estimators=400, min_child_samples=100, **kw).fit(d[CF], d.win)
+    reg = lgb.LGBMRegressor(**reg_params(FEATS)).fit(d[FEATS], d.y_rem)
+    clf = lgb.LGBMClassifier(**clf_params(CF)).fit(d[CF], d.win)
     r = d.y_rem - reg.predict(d[FEATS])
     bsig = float((r**2 / np.maximum(d.t / 3600, 0.02)).mean() ** 0.5)
-    m = dict(reg=reg, clf=clf, sig=sig, bsig=bsig)
+    return dict(reg=reg, clf=clf, sig=sig, bsig=bsig)
+
+
+def fit_and_save() -> dict:
+    m = fit_win_models(add_ep(load().to_pandas()))
+    sig, bsig = m["sig"], m["bsig"]
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(m, MODEL_PATH)
     print(f"saved {MODEL_PATH}  brownian sigma={sig:.2f} learned sigma={bsig:.2f}")
@@ -96,23 +101,30 @@ def spread_line_from_details(details, spread, home) -> float:
     return -float(spread) if spread is not None and not pd.isna(spread) else np.nan
 
 
-def score_snapshots(df: pd.DataFrame, prior: pd.Series | None = None) -> pd.DataFrame:
-    """Add model columns to snapshot rows.
+def score_states(d: pd.DataFrame, m: dict | None = None, dist=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Core scorer on canonical game-state rows. Returns (p_home_win, mu, pmf):
+    mu = predicted REMAINING home margin, pmf = distribution over live.dist.REM.
 
-    prior: Series game_id -> pregame spread_line (home-positive). The prior must
-    be the PREGAME line; the live line moves with the score and would leak it.
-    Adds: t, spread_prior, p_model, fair_home_margin (expected final),
-    p_line (win prob implied by the CURRENT posted spread), line_margin, gap.
+    Needs columns: period, clock_sec (seconds left in the period), lead (home
+    minus away), pos_home (0/1), down, distance, ydl (yards to the end zone for
+    the team with the ball), home_timeouts, away_timeouts, spread_prior (PREGAME
+    line, home-positive), total, stable (bool: possession/down/field position
+    are trustworthy). A 2nd-half kickoff is down=NaN, distance=0, ydl=35,
+    stable=True, matching how nflfastR stores kickoffs in the training data.
+
+    m/dist default to the saved live models; the backtest passes models fit
+    only on games before the test window.
     """
-    m = get_model()
-    d = df.copy()
+    from .dist import get_dist, pmf
+    m = m or get_model()
+    if dist is None:
+        dist = m["dist"] if m.get("dist") is not None else get_dist()
+    d = d.copy()
     d["t"] = seconds_left(d.period.fillna(0), d.clock_sec.fillna(0))
-    d["lead"] = d.home_score - d.away_score
-    d["pos_home"] = (d.possession == d.home).astype(int)
-    d["ydl"] = [yardline_100(a, b) for a, b in zip(d.yard_line_text, d.possession)]
-    d["line_spread"] = [spread_line_from_details(a, b, h) for a, b, h in zip(d.spread_details, d.spread, d.home)]
-    d["spread_prior"] = d.game_id.map(prior) if prior is not None else d.line_spread
-    d["spread_prior"] = d.spread_prior.fillna(d.line_spread).fillna(0.0)
+    # Unstable rows (kickoffs/PATs/reviews in the live feed): blank the play
+    # state and average over who has the ball instead of trusting it.
+    d.loc[~d.stable, ["down", "distance", "ydl"]] = np.nan
+
     def build(pos_home: pd.Series) -> pd.DataFrame:
         X = pd.DataFrame({
             "t": d.t, "lead": d.lead, "spread": d.spread_prior, "total": d.total.fillna(45.0), "pos_home": pos_home,
@@ -130,27 +142,45 @@ def score_snapshots(df: pd.DataFrame, prior: pd.Series | None = None) -> pd.Data
         w = np.clip((900 - X.t) / 600, 0, 1)
         return (1 - w) * p_reg + w * m["clf"].predict_proba(X[CF])[:, 1], mu
 
-    # Between plays (kickoffs, PATs, reviews) ESPN sends down=-1 / no possession
-    # / junk field position. Those rows are "unstable": blank the play-state
-    # inputs and average over who has the ball instead of trusting them.
-    d["stable"] = d.possession.map(lambda v: isinstance(v, str)) & d.down.between(1, 4) & d.ydl.notna()
-    d.loc[~d.stable, ["down", "distance", "ydl"]] = np.nan
     X = build(d.pos_home)
     p, mu = predict(X)
-    from .dist import get_dist, mean_final, pmf
-    P = pmf(get_dist(), X)
+    P = pmf(dist, X)
     if (~d.stable).any():
         X0 = build(1 - d.pos_home)
         p0, mu0 = predict(X0)
         p = np.where(d.stable, p, (p + p0) / 2)
         mu = np.where(d.stable, mu, (mu + mu0) / 2)
-        P = np.where(d.stable.values[:, None], P, (P + pmf(get_dist(), X0)) / 2)
+        P = np.where(d.stable.values[:, None], P, (P + pmf(dist, X0)) / 2)
+    return np.asarray(p), np.asarray(mu), P
+
+
+def score_snapshots(df: pd.DataFrame, prior: pd.Series | None = None) -> pd.DataFrame:
+    """Add model columns to ESPN snapshot rows (live/poll.py format).
+
+    prior: Series game_id -> pregame spread_line (home-positive). The prior must
+    be the PREGAME line; the live line moves with the score and would leak it.
+    Adds: t, spread_prior, p_model, fair_home_margin (expected final),
+    p_line (win prob implied by the CURRENT posted spread), line_margin, gap.
+    """
+    from .dist import mean_final
+    m = get_model()
+    d = df.copy()
+    d["t"] = seconds_left(d.period.fillna(0), d.clock_sec.fillna(0))
+    d["lead"] = d.home_score - d.away_score
+    d["pos_home"] = (d.possession == d.home).astype(int)
+    d["ydl"] = [yardline_100(a, b) for a, b in zip(d.yard_line_text, d.possession)]
+    d["line_spread"] = [spread_line_from_details(a, b, h) for a, b, h in zip(d.spread_details, d.spread, d.home)]
+    d["spread_prior"] = d.game_id.map(prior) if prior is not None else d.line_spread
+    d["spread_prior"] = d.spread_prior.fillna(d.line_spread).fillna(0.0)
+    d["stable"] = d.possession.map(lambda v: isinstance(v, str)) & d.down.between(1, 4) & d.ydl.notna()
+    p, mu, P = score_states(d, m)
+    d.loc[~d.stable, ["down", "distance", "ydl"]] = np.nan
     d["pmf"] = list(P)  # distribution over remaining margin (live.dist.REM), for spread pricing
     d["dist_margin"] = mean_final(P, d.lead)
     final = d.state == "post"
     p = np.where(final, (d.lead > 0).astype(float) + 0.5 * (d.lead == 0), p)
     d["p_model"] = p
-    d["fair_home_margin"] = X.lead + mu
+    d["fair_home_margin"] = d.lead + mu
     live_final = d.line_spread  # home-positive: expected final margin implied by the current line
     d["line_margin"] = live_final
     d["p_line"] = norm.cdf(live_final / (m["sig"] * np.sqrt(np.maximum(d.t, 1) / 3600)).clip(lower=0.5))

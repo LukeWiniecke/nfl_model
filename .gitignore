@@ -32,3 +32,8 @@ data/live/
 # Local secrets (dashboard password, API keys) -- never commit, set via
 # Streamlit Community Cloud's Secrets UI in production
 .streamlit/secrets.toml
+
+# Private, never commit (NDA-covered data, code and notes; see CLAUDE.local.md)
+live_betting_model/private/
+live/private/
+CLAUDE.local.md

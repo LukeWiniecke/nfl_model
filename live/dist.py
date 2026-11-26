@@ -28,8 +28,10 @@ DIST_PATH = Path(__file__).resolve().parents[1] / "data/live/dist.joblib"
 CLIP = 28
 REM = np.arange(-CLIP, CLIP + 1)  # class i <-> remaining margin REM[i]
 DF = FEATS + ["pos_lead", "z", "home_to", "away_to", "pos_spread"]
+# min_child_samples 300 -> 3000 for the same game-memorisation reason as baseline.MIN_LEAF
+# (held out 2022-25: cover log loss 0.5928 -> 0.5908, win Brier 0.1576 -> 0.1562).
 PARAMS = dict(objective="multiclass", num_class=len(REM), n_estimators=120, learning_rate=0.08, num_leaves=15,
-              min_child_samples=300, subsample=0.6, subsample_freq=1, colsample_bytree=0.8, verbose=-1)
+              min_child_samples=3000, subsample=0.6, subsample_freq=1, colsample_bytree=0.8, verbose=-1)
 
 
 def _fit(d: pd.DataFrame) -> lgb.LGBMClassifier:
@@ -65,13 +67,13 @@ def evaluate():
     final = (te.lead + te.y_rem).values
 
     # Gaussian baseline (the current model's shape): remaining-margin regressor + sigma*sqrt(t)
-    kw = dict(learning_rate=0.03, num_leaves=31, subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1)
-    reg = lgb.LGBMRegressor(n_estimators=300, min_child_samples=200, **kw).fit(tr[FEATS], tr.y_rem)
+    from .baseline import clf_params, reg_params
+    reg = lgb.LGBMRegressor(**reg_params(FEATS)).fit(tr[FEATS], tr.y_rem)
     r = tr.y_rem - reg.predict(tr[FEATS])
     bsig = float((r**2 / np.maximum(tr.t / 3600, 0.02)).mean() ** 0.5)
     mu = te.lead.values + reg.predict(te[FEATS])
     sd = bsig * np.sqrt(np.maximum(te.t.values / 3600, 0.02))
-    clf = lgb.LGBMClassifier(n_estimators=400, min_child_samples=100, **kw).fit(tr[CF], tr.win)
+    clf = lgb.LGBMClassifier(**clf_params(CF)).fit(tr[CF], tr.win)
     w = np.clip((900 - te.t.values) / 600, 0, 1)
     p_blend = (1 - w) * norm.cdf(mu / sd) + w * clf.predict_proba(te[CF])[:, 1]
 

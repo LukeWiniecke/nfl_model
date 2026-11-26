@@ -3,7 +3,7 @@
 Referencing this folder means: you are working on the **in-game win-probability / live odds model** for the NFL project in the parent directory. Read this file and `STATUS.md` first. The pregame model (`src/`, `main.py`) is separate; see the repo `README.md` and `docs/RESEARCH_LOG.md` for it.
 
 ## Goal
-Keep it simple: estimate how odds should shift as plays progress. Model P(home wins) and the expected final margin from the game state, compare it with the sportsbook line, and show the gap. Research and monitoring tool, **not betting advice** and not a backtested edge (no historical in-game odds exist in this repo).
+Keep it simple: estimate how odds should shift as plays progress. Model P(home wins), the final-margin distribution (spreads) and the remaining-points distribution (totals) from the game state, compare them with the live market, and look for alpha. Research tool, **not betting advice**.
 
 ## Code map (all under `live/`, plus `app/live_tab.py`)
 | File | Role |
@@ -14,6 +14,7 @@ Keep it simple: estimate how odds should shift as plays progress. Model P(home w
 | `states.py` | Builds `data/raw/nflverse/pbp_states.parquet` (793k plays, 28 cols; the main pipeline's pbp cache has only 18 and cannot be used). |
 | `ep.py` | Expected points for the offense, distilled from nflfastR `ep` using only live-available inputs. Adds `ep_home`, `eff_lead`. |
 | `dist.py` | Multiclass model of the full remaining-margin distribution; `prob_final_gt` gives cover probability for any line, `ladder` builds the fair spread ladder. Saved to `data/live/dist.joblib`. |
+| `totals.py` | Multiclass model of the remaining total points (0-75); `prob_over` prices any total. Saved to `data/live/totals.joblib`. |
 | `baseline.py` | Walk-forward evaluation: Brownian, learned margin, direct classifier, blend vs nflfastR `wp`/`vegas_wp`. Run `python -m live.baseline`. |
 | `model.py` | Final model fit on all seasons -> `data/live/model.joblib`; `score_snapshots` turns snapshot rows into probabilities. |
 | `monitor.py` | Terminal table (`python -m live.monitor`). |
@@ -26,6 +27,7 @@ Run everything with `.venv/bin/python` from the repo root.
 - Target: final home margin. Prior = **pregame** closing spread (never the live line; it leaks the score).
 - Early game: LightGBM predicts remaining margin (final minus current), Normal around it. Last 15 minutes: blend linearly (over 10 min) into a direct LightGBM win classifier, because the Gaussian misses clock mechanics.
 - Validation: walk-forward by season (train on earlier seasons), regular season only, 2021-2026 test. Never split by play; plays within a game are correlated.
+- **Leaf size matters:** a game is ~150 plays, so small LightGBM leaves can be a handful of games, and game-constant inputs (pregame spread/total) let the trees memorise those games. Shared settings live in `baseline.py` (`MIN_LEAF` = 3000 plays, monotone constraints on lead/spread/EP); `dist.py` and `totals.py` use the same leaf size. Keep it when adding features.
 - Brier by time left (lower better): see `STATUS.md` for the current table. Benchmark to beat is nflfastR `vegas_wp`; we are close but behind, mainly in the last 5 minutes.
 - Fair line = -(lead + predicted remaining margin), home-positive convention below.
 - Spread prices come from `dist.py` (full distribution: key numbers, skew, late-game width), not from the Gaussian. Win probability and spread ladder are two models and can disagree slightly; that is known.
@@ -39,6 +41,8 @@ Run everything with `.venv/bin/python` from the repo root.
 - `line_margin`/`p_line` use the *posted* spread as the market's expected final margin with a Brownian sigma. This is an approximation, not the book's price. The scoreboard feed has **no moneyline** (`pickcenter` in the per-game summary endpoint does).
 - Timeouts missing from the feed default to 3 (the Live tab flags this).
 - Local timezone of the machine is CST; kickoff times from ESPN are UTC.
+- 2nd-half kickoff receiver = the team that kicked off to start the game (true in all 2,924 games checked). In the training data a kickoff row is down NaN, distance 0, yardline 35, timeouts 3.
+- Backtesting: the saved live model is refit weekly on everything, so it has seen any past game. Fit a model with a cutoff before the test window.
 
 ## Automation (macOS launchd, nothing manual)
 - `com.nflmodel.livewatcher` (KeepAlive, wrapped in `caffeinate -i`): runs `live.watcher`. Log: `logs/watcher.log`.
@@ -46,6 +50,9 @@ Run everything with `.venv/bin/python` from the repo root.
 - Plists live in `~/Library/LaunchAgents`. Check with `launchctl list | grep nflmodel`.
 - **Known weakness:** `caffeinate -i` does not stop sleep when the lid is closed or on battery; the log showed multi-hour gaps overnight. Hosting on an always-on machine would fix this.
 - Dashboard: `streamlit run app/streamlit_app.py` (port 8501). Streamlit caches imported modules, so after editing a tab module restart the server rather than relying on hot reload.
+
+## Private material
+- The repo is public. Some data, code and notes for this project are confidential and live only in gitignored paths (`live/private/`, `live_betting_model/private/`, `data/raw/`, `CLAUDE.local.md`). Read `CLAUDE.local.md` before working with them, never move anything from those paths into tracked files, and keep tracked files free of names, numbers or descriptions that come from them. A local pre-commit hook blocks this, but don't rely on it.
 
 ## How to work here
 - Verify, don't assume. The ESPN live fields (timeouts, in-game spread movement, field-position text) were untested on a real in-progress game until the first live recording; check `STATUS.md` for what has been confirmed.
@@ -55,9 +62,7 @@ Run everything with `.venv/bin/python` from the repo root.
 - Test with `live.replay` + `NFL_LIVE_DIR=<dir>` (the monitor and tab both honor it) instead of waiting for games.
 
 ## Next ideas (in rough priority)
-1. Verify the live feed fields against real games; fix mappings in `espn.py`/`model.py`.
-2. Close the late-game gap: explicit clock mechanics (two-score threshold, first downs to kill clock, timeouts) or a drive-level simulation.
-3. Pull per-game `pickcenter` moneyline so the market probability is the book's own, not spread-derived.
-4. Fair-total model and live over/under comparison.
-5. Alerts when |gap| exceeds a threshold; always-on hosting (VM or Tailscale for access).
-6. Compare model vs recorded live lines once several weeks of snapshots exist.
+1. Close the late-game gap: explicit clock mechanics (two-score threshold, first downs to kill clock, timeouts) or a drive-level simulation.
+2. Use the market as an input: a blend of model and market that is better than either, if the model ever proves to add information.
+3. Live halftime receiver in `score_snapshots` (opening kicker rule) so halftime isn't averaged over possession.
+4. Alerts when |gap| exceeds a threshold; always-on hosting (VM or Tailscale for access).
