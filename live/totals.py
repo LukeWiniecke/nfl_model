@@ -11,7 +11,9 @@ v2 (2026-11-26) adds the decisions that change scoring as a game develops:
   - each team's implied points from the pregame lines;
   - the real shape of scoring through a game (bumps before halftime and at the end) instead
     of a straight line, learned from the training seasons and saved with the model;
-  - tempo: plays per minute so far (counted the way the live feed counts snaps).
+  - tempo: plays per minute so far (counted the way the live feed counts snaps);
+  - kickoff weather (indoor, temperature, wind, rain, snow; live/weather.py), typical-outdoor defaults
+    when unknown. Fixes a ~1-point over-prediction in windy / wet games.
 Held out 2022-25 (train <= 2021): over/under log loss 0.5874 -> 0.5865, last 5 minutes
 0.3366 -> 0.3270, calibration of late over/under probabilities still ~1.0.
 
@@ -36,7 +38,7 @@ from .baseline import MIN_LEAF, PATH, load
 from .ep import EP_FEATS, get_ep_model
 
 TOT_PATH = Path(__file__).resolve().parents[1] / "data/live/totals.joblib"
-VERSION = 2
+VERSION = 3
 CLIP = 75
 RT = np.arange(0, CLIP + 1)  # class i <-> remaining points RT[i]
 BASE = ["t", "half_t", "qtr", "cur_total", "lead", "abs_lead", "spread", "total", "pos_home", "down", "ydstogo",
@@ -44,7 +46,8 @@ BASE = ["t", "half_t", "qtr", "cur_total", "lead", "abs_lead", "spread", "total"
 SCRIPT = ["off_imp", "def_imp", "pos_lead", "f_t", "exp_rem_curve", "garbage", "leader_ball_late", "trailer_ball_late",
           "two_min", "burn_margin", "need", "home_to", "away_to", "is_ot"]
 TEMPO = ["tempo", "plays_so_far", "pts_per_play"]
-TF = BASE + SCRIPT + TEMPO
+WX = ["indoor", "temp_f", "wind_mph", "rain", "snow"]  # kickoff weather (live/weather.py); defaults when unknown
+TF = BASE + SCRIPT + TEMPO + WX
 PLAYS_PER_MIN = 2.45  # league-typical snaps (downs 1-4) per game minute: fallback when the count is unknown
 PARAMS = dict(objective="multiclass", num_class=len(RT), n_estimators=120, learning_rate=0.08, num_leaves=15,
               min_child_samples=MIN_LEAF, subsample=0.6, subsample_freq=1, colsample_bytree=0.8, verbose=-1)
@@ -79,6 +82,9 @@ def base_features(d: pd.DataFrame) -> pd.DataFrame:
     d["plays_so_far"] = d.plays_so_far.fillna(np.round(elapsed_min * PLAYS_PER_MIN))
     d["tempo"] = d.plays_so_far / np.maximum(elapsed_min, 3)
     d["pts_per_play"] = d.cur_total / np.maximum(d.plays_so_far, 10)
+    from .weather import DEFAULTS
+    for c, v in DEFAULTS.items():
+        d[c] = d[c].astype(float).fillna(v) if c in d else v
     return d
 
 
@@ -105,7 +111,8 @@ def training_frame() -> pd.DataFrame:
            .with_columns(cur_total=pl.col("post").shift(1).over("game_id").fill_null(0),
                          plays_so_far=pl.col("snap").cum_sum().shift(1).over("game_id").fill_null(0))
            .select("game_id", "play_id", "cur_total", "plays_so_far", final_total=pl.col("total")))
-    d = load().join(raw, on=["game_id", "play_id"], how="left").to_pandas()
+    from .weather import game_weather
+    d = load().join(raw, on=["game_id", "play_id"], how="left").to_pandas().merge(game_weather(), on="game_id", how="left")
     d = d[d.final_total.notna() & d.cur_total.notna()]
     d["y_rem_tot"] = d.final_total - d.cur_total
     d = d[d.y_rem_tot >= 0]
@@ -180,6 +187,7 @@ def score_states_totals(d: pd.DataFrame, model=None) -> np.ndarray:
             "pos_to": np.where(pos_home == 1, d.home_timeouts, d.away_timeouts),
             "def_to": np.where(pos_home == 1, d.away_timeouts, d.home_timeouts),
             "plays_so_far": d["plays_so_far"] if "plays_so_far" in d else np.nan,
+            **{c: d[c] for c in WX if c in d},
         }).astype(float)
         X[["pos_to", "def_to"]] = X[["pos_to", "def_to"]].fillna(3.0)
         return curve_features(base_features(X), model["curve"])

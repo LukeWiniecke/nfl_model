@@ -63,6 +63,19 @@ outcome classes), in-game offensive efficiency (EPA/play, success rate: 0.5865 -
 Takeaway: on history the game state explains only a little more of remaining scoring; the decision
 effects are real but mostly matter in the last 5-10 minutes.
 
+## Totals v3 (2026-11-26): kickoff weather, ADOPTED
+`live/weather.py`: roof type, temperature and wind from the nflverse schedule; rain/snow parsed from the
+play-by-play weather description (about 7% of games). Held out 2022-25 (train <= 2021):
+| Variant | All plays | Bad weather (wind 15+, rain/snow; 10% of plays) | Other games | Bias in bad weather |
+|---|---|---|---|---|
+| Totals v2 | 0.5872 | 0.5788 | 0.5881 | -1.02 pts (too high) |
+| **+ indoor, temp, wind, rain, snow (v3)** | **0.5868** | 0.5760 | **0.5880** | -0.15 |
+| + weather without wind | 0.5874 | 0.5735 | 0.5890 | -0.38 |
+| + wind only | 0.5877 | 0.5782 | 0.5888 | -0.57 |
+Every quarter improves a little; the pregame total under-prices bad weather for the rest of a game.
+Live: ESPN's scoreboard gives indoor, temperature and a conditions text but not wind; without a wind
+source the model falls back to a typical 8 mph (the no-wind variant has no overall gain on history).
+
 ## Team tendencies (2026-11-26): tested, NOT adopted
 `live/tendencies.py` builds leakage-free pregame tendencies per team from nflverse play-by-play, in
 neutral states (Q1-Q3, score within 10): pace (seconds between snaps), no-huddle rate, pass rate over
@@ -130,6 +143,7 @@ Multiclass LightGBM over integer remaining margin (+/-28). Used for SPREAD prici
 - 2026-11-15: added EP feature (`ep_home`, `eff_lead`), refit model. Remaining bias: punting situations still ~1 pt too high for the punting team.
 - 2026-11-15: added margin-distribution model and a fair live spread ladder in the Live tab (centred on the 50/50 line). Checked Q4 behaviour by score: model's mean remaining margin is within ~0.5 pt per lead bucket, but the gaussian sd was 10-25% too narrow late, which motivated this.
 - 2026-11-24: weekly refresh failed (no network after wake, DNS errors); refresh script now retries 6x and refits the live models.
+- 2026-11-26: totals v3 = v2 + kickoff weather (live/weather.py).
 - 2026-11-26: team tendency features (pace, no-huddle, PROE, 4th-down and 2-point aggressiveness) tested for totals and win prob: worse on held-out seasons, not adopted.
 - 2026-11-26: totals v2 (game-script/decision features + tempo).
 - 2026-11-26: v2 win-prob model (2nd-half kickoff receiver + possession classifier from halftime); live model refit.

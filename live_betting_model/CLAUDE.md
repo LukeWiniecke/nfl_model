@@ -15,6 +15,7 @@ Keep it simple: estimate how odds should shift as plays progress. Model P(home w
 | `ep.py` | Expected points for the offense, distilled from nflfastR `ep` using only live-available inputs. Adds `ep_home`, `eff_lead`. |
 | `dist.py` | Multiclass model of the full remaining-margin distribution; `prob_final_gt` gives cover probability for any line, `ladder` builds the fair spread ladder. Saved to `data/live/dist.joblib`. |
 | `totals.py` | Multiclass model of the remaining total points (0-75) with game-script/decision features, tempo and a learned scoring curve (saved with the model); `prob_over` prices any total. Callers may pass `plays_so_far` (snaps with a down 1-4 so far); otherwise it is estimated from the clock. Saved to `data/live/totals.joblib`. |
+| `weather.py` | Kickoff weather per game from nflverse (indoor, temp, wind, rain/snow) for the totals model. Live: ESPN scoreboard has indoor/temp/conditions but no wind. |
 | `tendencies.py` | Leakage-free pregame team tendencies (pace, no-huddle, PROE, 4th-down/2-point aggressiveness) from nflverse. Tested as model inputs and rejected (see STATUS.md); kept for analysis. |
 | `baseline.py` | Walk-forward evaluation: Brownian, learned margin, direct classifier, blend vs nflfastR `wp`/`vegas_wp`. Run `python -m live.baseline`. |
 | `model.py` | Final model fit on all seasons -> `data/live/model.joblib`; `score_snapshots` turns snapshot rows into probabilities. |
